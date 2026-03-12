@@ -79,8 +79,18 @@ class InteractionMeshRetargeter:
             nominal_tracking_tau: the time constant for the nominal tracking cost.
         """
 
-        self.robot_model_path = task_constants.ROBOT_URDF_FILE
-        self.object_model_path = object_urdf_path
+        pkg_root = Path(__file__).resolve().parents[1]
+
+        def _resolve_pkg_path(path_str: str | None) -> str | None:
+            if path_str is None:
+                return None
+            path_obj = Path(path_str)
+            if path_obj.is_absolute():
+                return str(path_obj)
+            return str(pkg_root / path_obj)
+
+        self.robot_model_path = _resolve_pkg_path(task_constants.ROBOT_URDF_FILE)
+        self.object_model_path = _resolve_pkg_path(object_urdf_path)
         self.object_name = task_constants.OBJECT_NAME
         self.collision_detection_threshold = collision_detection_threshold
         self.activate_foot_sticking = activate_foot_sticking
@@ -108,10 +118,16 @@ class InteractionMeshRetargeter:
             self._setup_visualization()
 
         # Load Mujoco model
-        if self.object_name == "ground":
+        if self.robot_model_path is None:
+            raise ValueError("ROBOT_URDF_FILE must be set in task constants")
+
+        scene_xml_override = getattr(self.task_constants, "ROBOT_SCENE_XML_FILE", None)
+        if scene_xml_override:
+            robot_xml_path = _resolve_pkg_path(scene_xml_override) or scene_xml_override
+        elif self.object_name == "ground":
             robot_xml_path = self.robot_model_path.replace(".urdf", ".xml")
         elif self.object_name == "multi_boxes":
-            robot_xml_path = self.task_constants.SCENE_XML_FILE
+            robot_xml_path = _resolve_pkg_path(self.task_constants.SCENE_XML_FILE) or self.task_constants.SCENE_XML_FILE
         else:
             robot_xml_path = self.robot_model_path.replace(".urdf", "_w_" + self.object_name + ".xml")
 
@@ -168,6 +184,8 @@ class InteractionMeshRetargeter:
     def _setup_visualization(self):
         """Setup Viser visualization components."""
         self.server = viser.ViserServer()
+        # yourdfpy scene graph can fail on some URDFs; avoid mesh scene building by default
+        load_meshes = False
 
         # 1) Ensure a world frame exists (absolute path!)
         try:
@@ -181,8 +199,9 @@ class InteractionMeshRetargeter:
         # Load robot URDF
         self.robot_urdf = yourdfpy.URDF.load(
             self.robot_model_path,
-            load_meshes=True,
-            build_scene_graph=True,
+            load_meshes=load_meshes,
+            build_scene_graph=False,
+            build_collision_scene_graph=False,
         )
 
         print("Viser using robot URDF: ", self.robot_model_path)
@@ -192,6 +211,7 @@ class InteractionMeshRetargeter:
             self.server,
             urdf_or_path=self.robot_urdf,
             root_node_name="/world/robot",  # This links to the robot_base frame we created
+            load_meshes=load_meshes,
         )
 
         # Similarly for object
@@ -200,8 +220,9 @@ class InteractionMeshRetargeter:
 
             self.object_urdf = yourdfpy.URDF.load(
                 self.object_model_path,
-                load_meshes=True,
-                build_scene_graph=True,
+                load_meshes=load_meshes,
+                build_scene_graph=False,
+                build_collision_scene_graph=False,
             )
 
             # Create ViserUrdf instance for object, attaching it to the object_base frame
@@ -209,6 +230,7 @@ class InteractionMeshRetargeter:
                 self.server,
                 urdf_or_path=self.object_urdf,
                 root_node_name="/world/object",  # This links to the object_base frame we created
+                load_meshes=load_meshes,
             )
             print("Viser using object URDF: ", self.object_model_path)
 
@@ -299,6 +321,7 @@ class InteractionMeshRetargeter:
         q_nominal_list=None,
         original=True,
         dest_res_path=None,
+        fps: int = 30,
     ):
         """
         The main function to retarget an entire motion sequence frame by frame.
@@ -429,12 +452,30 @@ class InteractionMeshRetargeter:
             robot_kpts_handle_list.clear()
 
         # Save results
+        qpos_arr = np.array(retargeted_motions)[1:]
+        body_positions = qpos_arr[:, :3][:, None, :]
+        body_rotations = qpos_arr[:, 3:7][:, None, :]
+        dof_positions = qpos_arr[:, 7:]
+        save_payload = {
+            "qpos": qpos_arr,
+            "human_joints": human_joint_motions,
+            "fps": fps,
+            "cost": cost,
+            # MuJoCo player Stage2 compatibility
+            "body_positions": body_positions.astype(np.float32),
+            "body_rotations": body_rotations.astype(np.float32),
+            "dof_positions": dof_positions.astype(np.float32),
+        }
+
+        # Explicitly export dynamic object world trajectory when present.
+        # Layout follows existing qpos tail convention: [..., obj_xyz(3), obj_quat_wxyz(4)]
+        if qpos_arr.shape[1] >= (7 + self.task_constants.ROBOT_DOF + 7):
+            save_payload["object_pos_w"] = qpos_arr[:, -7:-4].astype(np.float32)
+            save_payload["object_quat_w"] = qpos_arr[:, -4:].astype(np.float32)
+
         np.savez(
             dest_res_path,
-            qpos=np.array(retargeted_motions)[1:],
-            human_joints=human_joint_motions,
-            fps=30,
-            cost=cost,
+            **save_payload,
         )
         print("Saving results to path:", dest_res_path)
 
@@ -1025,6 +1066,11 @@ class InteractionMeshRetargeter:
         Fast analytic version: J_qdot = J_v @ T(q)
         """
 
+        # Normalize body index in case it arrives as a numpy scalar/array
+        if not np.isscalar(body_idx):
+            body_idx = np.asarray(body_idx).reshape(-1)[0]
+        body_idx = int(body_idx)
+
         p_body = np.asarray(p_body, dtype=float).reshape(3)
 
         # 1) Make sure kinematics are current once
@@ -1042,7 +1088,7 @@ class InteractionMeshRetargeter:
         # 3) J_v: translational Jacobian wrt generalized velocities (3 x nv)
         Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
         Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
-        mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_idx))  # Jp = J_v
+        mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, body_idx)  # Jp = J_v
 
         T = self._build_transform_qdot_to_qvel_fast()
 

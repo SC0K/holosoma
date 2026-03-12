@@ -359,7 +359,12 @@ def transform_from_human_to_world(human_initial_root, object_initial_pose, local
         tuple: (world_translation, quaternion) - transformed translation and rotation.
     """
     human_to_object_2d = object_initial_pose[-3:-1] - human_initial_root[:2]
-    x_axis_2d = human_to_object_2d / np.linalg.norm(human_to_object_2d)
+    norm = np.linalg.norm(human_to_object_2d)
+    if norm < 1e-8:
+        # Fallback to a stable frame when human/object XY coincide.
+        x_axis_2d = np.array([1.0, 0.0])
+    else:
+        x_axis_2d = human_to_object_2d / norm
     x_axis = np.array([x_axis_2d[0], x_axis_2d[1], 0.0])
     z_axis = np.array([0.0, 0.0, 1.0])
     y_axis = np.cross(z_axis, x_axis)
@@ -769,6 +774,17 @@ def estimate_human_orientation(human_joints, joint_names, frame_idx=0):
         spine_idx = joint_names.index("Spine")
         left_hip_idx = joint_names.index("LeftUpLeg")
         right_hip_idx = joint_names.index("RightUpLeg")
+    # For HumanML3D (MotionGPT T2M order)
+    elif "pelvis" in joint_names:
+        hips_idx = joint_names.index("pelvis")
+        for spine_name in ("spine1", "spine2", "spine3", "neck"):
+            if spine_name in joint_names:
+                spine_idx = joint_names.index(spine_name)
+                break
+        else:
+            raise ValueError("No spine joint found in HumanML3D joint names.")
+        left_hip_idx = joint_names.index("left_hip")
+        right_hip_idx = joint_names.index("right_hip")
     else:
         # For SMPLH (OMOMO_new)
         hips_idx = joint_names.index("Pelvis")

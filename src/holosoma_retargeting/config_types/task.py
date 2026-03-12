@@ -37,3 +37,13 @@ class TaskConfig:
     # Object directory (for climbing tasks)
     # Auto-determined from data_path / task_name if None
     object_dir: Path | None = None
+
+    # BEHAVE object params root for object_interaction with SMPL-H .npz input.
+    # Expected layout: <object_params_root>/<task_name>/object_fit_all.npz
+    object_params_root: Path | None = None
+
+    # File name for BEHAVE object trajectory params.
+    object_params_filename: str = "object_fit_all.npz"
+
+    # BEHAVE object meshes root. Expected layout: <object_mesh_root>/<cat>/<cat>.obj
+    object_mesh_root: Path | None = None

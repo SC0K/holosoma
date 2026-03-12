@@ -64,6 +64,9 @@ class RetargetingConfig:
     """Retargeter configuration (nested - can override q_a_init_idx, activate_joint_limits, etc.
     via --retargeter.q-a-init-idx)."""
 
+    fps: int = 30
+    """FPS metadata for saved retargeted motion."""
+
 
 @dataclass
 class ParallelRetargetingConfig(RetargetingConfig):
@@ -80,3 +83,6 @@ class ParallelRetargetingConfig(RetargetingConfig):
 
     max_workers: int | None = None
     """Maximum number of parallel workers. Auto-determined if None."""
+
+    max_files: int | None = None
+    """Optional cap on number of files to process (useful for memory control)."""

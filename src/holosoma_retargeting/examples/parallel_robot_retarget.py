@@ -74,12 +74,14 @@ def find_files(data_dir: Path, data_format: str, object_name: str | None = None)
         files = [str(p) for p in data_dir.glob("*.npy")]
         return sorted(files)
     if data_format == "smplh":
-        # SMPLH/OMOMO: .pt files (optionally filtered by object_name)
+        # SMPLH: support both .pt (InterMimic) and processed .npz
         if object_name:
-            files = [str(p) for p in data_dir.glob(f"*{object_name}*.pt")]
+            pt_files = [str(p) for p in data_dir.glob(f"*{object_name}*.pt")]
+            npz_files = [str(p) for p in data_dir.glob(f"*{object_name}*.npz")]
         else:
-            files = [str(p) for p in data_dir.glob("*.pt")]
-        return sorted(files)
+            pt_files = [str(p) for p in data_dir.glob("*.pt")]
+            npz_files = [str(p) for p in data_dir.glob("*.npz")]
+        return sorted(pt_files + npz_files)
     if data_format == "mocap":
         # MOCAP: .npy files in subdirectories
         files = [str(p) for p in data_dir.glob("*/*.npy")]
@@ -91,6 +93,12 @@ def find_files(data_dir: Path, data_format: str, object_name: str | None = None)
     # For other data format, default to be consistent with SMPL-X
     files = [str(p) for p in data_dir.glob("*.npz")]
     return sorted(files)
+
+
+def limit_files(files: list[str], max_files: int | None) -> list[str]:
+    if max_files is None or max_files <= 0:
+        return files
+    return files[:max_files]
 
 
 def generate_augmentation_configs(task_type: str, augmentation: bool = True):
@@ -162,6 +170,35 @@ def process_single_task(args):
         augmentation,
     ) = args
 
+    try:
+        return _process_single_task_impl(
+            file_path,
+            save_dir,
+            task_type,
+            data_format,
+            robot_config,
+            motion_data_config,
+            task_config,
+            retargeter,
+            augmentation,
+        )
+    except Exception as e:
+        task_name = extract_task_name(file_path)
+        return {"status": "failed", "task": task_name, "error": str(e)}
+
+
+def _process_single_task_impl(
+    file_path,
+    save_dir,
+    task_type,
+    data_format,
+    robot_config,
+    motion_data_config,
+    task_config,
+    retargeter,
+    augmentation,
+):
+
     os.makedirs(save_dir, exist_ok=True)
     if task_type == "climbing":
         file_path = "/".join(file_path.split("/")[:-1])
@@ -180,7 +217,7 @@ def process_single_task(args):
 
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(
-        task_type, data_format, Path(file_path).parent, task_name, constants, motion_data_config
+        task_type, data_format, Path(file_path).parent, task_name, constants, motion_data_config, task_config
     )
 
     # Preserve original data (preprocess_motion_data modifies them in place)
@@ -300,6 +337,8 @@ def process_single_task(args):
             dest_res_path=file_name,
         )
 
+    return {"status": "ok", "task": task_name}
+
 
 def main(cfg: ParallelRetargetingConfig) -> None:
     """Main parallel retargeting pipeline.
@@ -330,6 +369,7 @@ def main(cfg: ParallelRetargetingConfig) -> None:
         files = find_files(data_dir, data_format)
     else:
         files = find_files(data_dir, data_format, cfg.task_config.object_name)
+    files = limit_files(files, cfg.max_files)
     print(f"Found {len(files)} files for task type: {task_type}")
 
     # Pass configs to worker processes
@@ -364,15 +404,14 @@ def main(cfg: ParallelRetargetingConfig) -> None:
         # Process completed tasks
         for future in as_completed(future_to_file):
             file_path = future_to_file[future]
-            try:
-                future.result()
+            result = future.result()
+            if isinstance(result, dict) and result.get("status") == "ok":
                 print(f"Completed: {file_path}")
                 successful += 1
-            except Exception as e:
-                print(f"Failed {file_path}: {e}")
-                import traceback
-
-                traceback.print_exc()
+            else:
+                task = result.get("task") if isinstance(result, dict) else "unknown"
+                error = result.get("error") if isinstance(result, dict) else str(result)
+                print(f"Failed {file_path} ({task}): {error}")
                 failed += 1
 
     end_time = time.time()
