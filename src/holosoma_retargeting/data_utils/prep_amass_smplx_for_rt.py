@@ -10,6 +10,21 @@ import tyro
 from human_body_prior.body_model.body_model import BodyModel  # type: ignore[import-not-found]
 
 
+def _normalize_gender_value(v) -> str:
+    """Normalize AMASS/CNRS gender tokens to {'male','female','neutral'}."""
+    if isinstance(v, bytes):
+        s = v.decode("utf-8", errors="ignore").strip().lower()
+    elif isinstance(v, np.ndarray) and v.shape == ():
+        s = str(v.item()).strip().lower()
+    else:
+        s = str(v).strip().lower()
+    if s in {"m", "male"}:
+        return "male"
+    if s in {"f", "female"}:
+        return "female"
+    return "neutral"
+
+
 def load_ori_npz_file(npz_file_path, dest_fps=30):
     """
     >>> import numpy as np
@@ -59,7 +74,8 @@ def run_smplx_model(
     aa_rot_rep = aa_rot_rep.reshape(bs * num_steps, -1, 3)  # (BS*T) X n_joints X 3
 
     betas = betas[:, None, :].repeat(1, num_steps, 1).reshape(bs * num_steps, -1)  # (BS*T) X 16
-    gender = np.asarray(gender)[:, np.newaxis].repeat(num_steps, axis=1)
+    gender = np.asarray([_normalize_gender_value(g) for g in np.asarray(gender).reshape(-1)], dtype=object)
+    gender = gender[:, np.newaxis].repeat(num_steps, axis=1)
     gender = gender.reshape(-1).tolist()  # (BS*T)
 
     smpl_trans = root_trans.reshape(-1, 3)  # (BS*T) X 3
@@ -77,9 +93,8 @@ def run_smplx_model(
         smpl_pose_body,
         smpl_pose_hand,
     ]
-    # batch may be a mix of genders, so need to carefully use the corresponding SMPL body model
-    # gender_names = ["male", "female", "neutral"]
-    gender_names = ["neutral"]  # We use neutral gender for all the data in G1 setting
+    # Batch may be a mix of genders, so use the corresponding SMPL-X body model.
+    gender_names = ["male", "female", "neutral"]
     pred_joints = []
     pred_verts = []
     prev_nbidx = 0
@@ -117,6 +132,12 @@ def run_smplx_model(
 
         pred_joints.append(pred_body.Jtr)
         pred_verts.append(pred_body.v)
+
+    if not pred_joints:
+        raise ValueError(
+            f"No valid gender frames found. Parsed genders: {sorted(set(gender))}. "
+            "Expected values in {'male','female','neutral'}."
+        )
 
     x_pred_smpl_joints = torch.cat(pred_joints, axis=0)  # () X 52 X 3
 
