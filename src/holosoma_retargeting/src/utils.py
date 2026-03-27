@@ -37,7 +37,10 @@ def load_intermimic_data(file_path):
 
 def calculate_scale_factor(task_name, robot_height):
     """Calculate scale factor based on human height."""
-    with open("demo_data/height_dict.pkl", "rb") as f:
+    # Resolve demo data from package root so callers can run from any cwd.
+    pkg_root = Path(__file__).resolve().parents[1]
+    height_dict_path = pkg_root / "demo_data" / "height_dict.pkl"
+    with open(height_dict_path, "rb") as f:
         height_dict = pickle.load(f)
     sub_name = task_name.split("_")[0]
     human_height = height_dict[sub_name]

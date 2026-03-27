@@ -7,11 +7,9 @@ Unified robot retargeting script for all task types:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -79,147 +77,6 @@ TaskType = Literal["robot_only", "object_interaction", "climbing"]
 
 
 # ----------------------------- Helper Functions -----------------------------
-
-
-def _rotvec_to_quat_wxyz(rotvec: np.ndarray) -> np.ndarray:
-    """Convert axis-angle vectors (..., 3) to quaternions (..., 4) in [w, x, y, z]."""
-    angle = np.linalg.norm(rotvec, axis=-1, keepdims=True)
-    half = 0.5 * angle
-    small = angle < 1e-8
-    axis = np.where(small, 0.0, rotvec / np.where(small, 1.0, angle))
-    qw = np.cos(half)
-    qxyz = axis * np.sin(half)
-    quat = np.concatenate([qw, qxyz], axis=-1)
-    quat = np.where(np.repeat(small, 4, axis=-1), np.array([1.0, 0.0, 0.0, 0.0]), quat)
-    return quat
-
-
-def _load_behave_object_poses(object_fit_path: Path) -> np.ndarray:
-    """Load BEHAVE object trajectory as [qw, qx, qy, qz, x, y, z]."""
-    if not object_fit_path.exists():
-        raise FileNotFoundError(f"BEHAVE object params not found: {object_fit_path}")
-
-    data = np.load(str(object_fit_path))
-    rot_key = "angles" if "angles" in data else "rotvec" if "rotvec" in data else None
-    trans_key = "trans" if "trans" in data else "translations" if "translations" in data else None
-
-    if rot_key is None or trans_key is None:
-        raise KeyError(
-            f"{object_fit_path} must contain rotation key ('angles' or 'rotvec') "
-            f"and translation key ('trans' or 'translations'). Found keys: {list(data.keys())}"
-        )
-
-    rotvec = np.asarray(data[rot_key])
-    trans = np.asarray(data[trans_key])
-    if rotvec.ndim != 2 or rotvec.shape[1] != 3:
-        raise ValueError(f"Invalid rotation shape in {object_fit_path}: expected (T,3), got {rotvec.shape}")
-    if trans.ndim != 2 or trans.shape[1] != 3:
-        raise ValueError(f"Invalid translation shape in {object_fit_path}: expected (T,3), got {trans.shape}")
-    if rotvec.shape[0] != trans.shape[0]:
-        raise ValueError(
-            f"Rotation/translation length mismatch in {object_fit_path}: {rotvec.shape[0]} vs {trans.shape[0]}"
-        )
-
-    quat_wxyz = _rotvec_to_quat_wxyz(rotvec)
-    return np.concatenate([quat_wxyz, trans], axis=1)
-
-
-def _resolve_behave_object_fit_path(data_path: Path, task_name: str, task_config: TaskConfig) -> Path:
-    """Resolve BEHAVE object_fit_all.npz path for a sequence."""
-    candidates = []
-    if task_config.object_params_root is not None:
-        candidates.append(task_config.object_params_root / task_name / task_config.object_params_filename)
-    candidates.append(data_path / task_name / task_config.object_params_filename)
-    candidates.append(data_path.parent / "behave-30fps-params-v1" / task_name / task_config.object_params_filename)
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    searched = "\n".join(f"  - {p}" for p in candidates)
-    raise FileNotFoundError(
-        "Could not find BEHAVE object params file. Set --task-config.object-params-root. "
-        f"Searched:\n{searched}"
-    )
-
-
-def _resolve_behave_info_path(data_path: Path, task_name: str, task_config: TaskConfig) -> Path:
-    """Resolve BEHAVE info.json path for a sequence."""
-    candidates = []
-    if task_config.object_params_root is not None:
-        candidates.append(task_config.object_params_root / task_name / "info.json")
-    candidates.append(data_path / task_name / "info.json")
-    candidates.append(data_path.parent / "behave-30fps-params-v1" / task_name / "info.json")
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    searched = "\n".join(f"  - {p}" for p in candidates)
-    raise FileNotFoundError(f"Could not find BEHAVE info.json for {task_name}. Searched:\n{searched}")
-
-
-def _resolve_behave_object_category(data_path: Path, task_name: str, task_config: TaskConfig) -> str:
-    """Read BEHAVE object category from info.json."""
-    info_path = _resolve_behave_info_path(data_path, task_name, task_config)
-    info = json.loads(info_path.read_text())
-    cat = info.get("cat")
-    if not isinstance(cat, str) or not cat:
-        raise KeyError(f"'cat' not found or invalid in {info_path}")
-    return cat
-
-
-def _resolve_behave_object_mesh_path(data_path: Path, object_cat: str, task_config: TaskConfig) -> Path:
-    """Resolve BEHAVE object mesh path <objects>/<cat>/<cat>.obj."""
-    roots = []
-    if task_config.object_mesh_root is not None:
-        roots.append(task_config.object_mesh_root)
-    if task_config.object_params_root is not None:
-        roots.append(task_config.object_params_root.parent / "objects")
-    roots.append(data_path.parent / "objects")
-
-    candidates: list[Path] = []
-    for root in roots:
-        candidates.append(root / object_cat / f"{object_cat}.obj")
-        candidates.append(root / object_cat / f"{object_cat}.ply")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    searched = "\n".join(f"  - {p}" for p in candidates)
-    raise FileNotFoundError(f"Could not find BEHAVE mesh for category '{object_cat}'. Searched:\n{searched}")
-
-
-def _build_scene_xml_with_override_mesh(robot_urdf_file: str, object_name: str, object_mesh_path: Path, task_name: str) -> Path:
-    """Create temp MuJoCo scene xml by overriding object mesh file path."""
-    pkg_root = src_root / "holosoma_retargeting"
-    robot_urdf_path = Path(robot_urdf_file)
-    if not robot_urdf_path.is_absolute():
-        robot_urdf_path = pkg_root / robot_urdf_path
-
-    base_scene = Path(str(robot_urdf_path).replace(".urdf", f"_w_{object_name}.xml"))
-    if not base_scene.exists() and object_name != "largebox":
-        base_scene = Path(str(robot_urdf_path).replace(".urdf", "_w_largebox.xml"))
-    if not base_scene.exists():
-        raise FileNotFoundError(f"Base scene xml not found for object override: {base_scene}")
-
-    tree = ET.parse(str(base_scene))
-    root = tree.getroot()
-
-    target_elem = None
-    for mesh in root.findall(".//asset/mesh"):
-        mesh_name = mesh.attrib.get("name", "")
-        mesh_file = mesh.attrib.get("file", "")
-        if mesh_name.endswith("_mesh") and ("largebox" in mesh_name or "largebox" in mesh_file):
-            target_elem = mesh
-            break
-    if target_elem is None:
-        raise ValueError(f"Could not find object mesh entry in {base_scene}")
-
-    target_elem.set("file", str(object_mesh_path))
-    # Keep the override XML next to the base scene so relative meshdir/assets paths remain valid.
-    out_path = base_scene.parent / f"{base_scene.stem}_{task_name}_objoverride.xml"
-    tree.write(str(out_path), encoding="utf-8", xml_declaration=False)
-    return out_path
 
 
 def create_task_constants(
@@ -324,7 +181,6 @@ def load_motion_data(
     task_name: str,
     constants: SimpleNamespace,
     motion_data_config: MotionDataConfig,
-    task_config: TaskConfig,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Load motion data based on task type and format.
 
@@ -335,7 +191,6 @@ def load_motion_data(
         task_name: Name of the task/sequence
         constants: Task constants
         motion_data_config: Motion data configuration
-        task_config: Task-specific config (used for BEHAVE object params lookup)
 
     Returns:
         Tuple of (human_joints, object_poses, smpl_scale)
@@ -406,37 +261,11 @@ def load_motion_data(
 
     elif task_type == "object_interaction":
         pt_path = data_path / f"{task_name}.pt"
-        npz_file = data_path / f"{task_name}.npz"
-        if pt_path.exists():
-            human_joints, object_poses = load_intermimic_data(str(pt_path))
-            smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
-        elif npz_file.exists():
-            human_data = np.load(str(npz_file))
-            if "global_joint_positions" not in human_data or "height" not in human_data:
-                raise KeyError(
-                    f"SMPL-H npz for object_interaction must contain 'global_joint_positions' and 'height': {npz_file}"
-                )
+        if not pt_path.exists():
+            raise FileNotFoundError(f"InterMimic data file not found: {pt_path}")
 
-            human_joints = human_data["global_joint_positions"]
-            human_height = float(np.asarray(human_data["height"]).reshape(-1)[0])
-            smpl_scale = constants.ROBOT_HEIGHT / human_height
-
-            object_fit_path = _resolve_behave_object_fit_path(data_path, task_name, task_config)
-            object_poses = _load_behave_object_poses(object_fit_path)
-
-            if human_joints.shape[0] != object_poses.shape[0]:
-                n_frames = min(human_joints.shape[0], object_poses.shape[0])
-                logger.warning(
-                    "Frame count mismatch for %s: human=%d, object=%d. Truncating both to %d frames.",
-                    task_name,
-                    human_joints.shape[0],
-                    object_poses.shape[0],
-                    n_frames,
-                )
-                human_joints = human_joints[:n_frames]
-                object_poses = object_poses[:n_frames]
-        else:
-            raise FileNotFoundError(f"Object interaction input not found: {pt_path} or {npz_file}")
+        human_joints, object_poses = load_intermimic_data(str(pt_path))
+        smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
 
     elif task_type == "climbing":
         task_dir = data_path / task_name
@@ -494,24 +323,13 @@ def setup_object_data(
 
     if task_type == "object_interaction":
         # Load object data
-        object_mesh_from_behave = getattr(constants, "BEHAVE_OBJECT_MESH_FILE", None)
-        object_mesh_src = object_mesh_from_behave if object_mesh_from_behave is not None else constants.OBJECT_MESH_FILE
-        if object_mesh_src is None:
+        if constants.OBJECT_MESH_FILE is None:
             raise ValueError("OBJECT_MESH_FILE not set for object_interaction task")
 
-        # Resolve package-relative paths so script works from any cwd.
-        pkg_root = src_root / "holosoma_retargeting"
-        object_mesh_file = Path(object_mesh_src)
-        if not object_mesh_file.is_absolute():
-            object_mesh_file = pkg_root / object_mesh_file
-        object_urdf_file = Path(constants.OBJECT_URDF_FILE) if constants.OBJECT_URDF_FILE is not None else None
-        if object_urdf_file is not None and not object_urdf_file.is_absolute():
-            object_urdf_file = pkg_root / object_urdf_file
-
         object_local_pts, object_local_pts_demo = load_object_data(
-            str(object_mesh_file), smpl_scale=smpl_scale, sample_count=100
+            constants.OBJECT_MESH_FILE, smpl_scale=smpl_scale, sample_count=100
         )
-        return object_local_pts, object_local_pts_demo, str(object_urdf_file) if object_urdf_file is not None else None
+        return object_local_pts, object_local_pts_demo, constants.OBJECT_URDF_FILE
 
     if task_type == "climbing":
         if object_dir is None:
@@ -825,30 +643,9 @@ def main(cfg: RetargetingConfig) -> None:
         task_type=task_type,
     )
 
-    # BEHAVE object metadata/mesh auto-resolution for object_interaction with SMPL-H data.
-    if task_type == "object_interaction" and data_format == "smplh":
-        try:
-            behave_cat = _resolve_behave_object_category(data_path, task_name, cfg.task_config)
-            behave_mesh = _resolve_behave_object_mesh_path(data_path, behave_cat, cfg.task_config)
-            constants.BEHAVE_OBJECT_CATEGORY = behave_cat
-            constants.BEHAVE_OBJECT_MESH_FILE = str(behave_mesh)
-            constants.ROBOT_SCENE_XML_FILE = str(
-                _build_scene_xml_with_override_mesh(
-                    constants.ROBOT_URDF_FILE,
-                    constants.OBJECT_NAME,
-                    behave_mesh,
-                    task_name,
-                )
-            )
-            logger.info("BEHAVE object category: %s", behave_cat)
-            logger.info("BEHAVE object mesh: %s", behave_mesh)
-            logger.info("Using scene XML override: %s", constants.ROBOT_SCENE_XML_FILE)
-        except Exception as e:
-            logger.warning("Could not auto-resolve BEHAVE object mesh/scene override: %s", e)
-
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(
-        task_type, data_format, data_path, task_name, constants, cfg.motion_data_config, cfg.task_config
+        task_type, data_format, data_path, task_name, constants, cfg.motion_data_config
     )
 
     # Get toe names from motion data config (depends only on data_format)

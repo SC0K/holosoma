@@ -46,7 +46,7 @@ def make_player(
 
     # Root frames
     robot_root = server.scene.add_frame("/robot", show_axes=False)
-    object_root = server.scene.add_frame("/object", show_axes=False)
+    object_root = server.scene.add_frame("/object", show_axes=config.show_object_axes)
 
     # URDFs (using yourdfpy so meshes show up)
     robot_urdf_y = yourdfpy.URDF.load(config.robot_urdf, load_meshes=True, build_scene_graph=True)

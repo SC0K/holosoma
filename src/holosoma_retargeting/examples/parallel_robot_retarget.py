@@ -217,7 +217,7 @@ def _process_single_task_impl(
 
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(
-        task_type, data_format, Path(file_path).parent, task_name, constants, motion_data_config, task_config
+        task_type, data_format, Path(file_path).parent, task_name, constants, motion_data_config
     )
 
     # Preserve original data (preprocess_motion_data modifies them in place)

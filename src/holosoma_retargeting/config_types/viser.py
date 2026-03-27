@@ -22,6 +22,9 @@ class ViserConfig:
     object_urdf: str | None = None
     """Path to object URDF file (optional)."""
 
+    show_object_axes: bool = True
+    """Whether to render XYZ axes for the object frame."""
+
     fps: int = 30
     """Frames per second for playback."""
 
