@@ -215,10 +215,10 @@ def infer_scaled_targets_with_corner_surface_alignment(
     dst_box: BoxFrame,
     ee_world: np.ndarray,
     robot_root: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Scale EE targets, then slide on the current target-box surface to match source corner-relative direction/distance."""
     if ee_world.size == 0:
-        return ee_world.copy()
+        return ee_world.copy(), ee_world.copy()
 
     scaled_world = infer_scaled_targets(src_box, dst_box, ee_world)
     scaled_local = dst_box.world_to_local(scaled_world)
@@ -245,8 +245,8 @@ def infer_scaled_targets_with_corner_surface_alignment(
         local = np.clip(desired_local, -half, half)
         local[face_axis] = face_val
         out_local[i] = local
-
-    return dst_box.local_to_world(out_local)
+    projected_world = dst_box.local_to_world(out_local)
+    return projected_world, scaled_world
 
 
 def map_point_by_box_corner_reference(src_box: BoxFrame, dst_box: BoxFrame, point_world: np.ndarray) -> np.ndarray:
@@ -664,6 +664,7 @@ def process_file(
             "dst_box_center_used": dst_box_used.center.copy(),
             "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
             "ee_targets_infer": np.empty((0, 3), dtype=np.float64),
+            "ee_targets_infer_scaled": np.empty((0, 3), dtype=np.float64),
             "dst_box_infer_center": np.zeros(3, dtype=np.float64),
             "dst_box_infer_size": np.zeros(3, dtype=np.float64),
             "dst_box_infer_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
@@ -674,6 +675,7 @@ def process_file(
     base_before = q0[0:3].copy()
     base_quat_before = q0[3:7].copy()
     targets_infer = np.empty((0, 3), dtype=np.float64)
+    targets_infer_scaled = np.empty((0, 3), dtype=np.float64)
     dst_box_infer = BoxFrame(
         center=np.zeros(3, dtype=np.float64),
         size=np.zeros(3, dtype=np.float64),
@@ -700,7 +702,7 @@ def process_file(
         selected_codes = _closest_corner_codes_for_ees(src_box_used, ee_world, base_before)
         src_corners_selected = np.vstack([_corner_world_from_code(src_box_used, c) for c in selected_codes])
         dst_corners_selected = np.vstack([_corner_world_from_code(dst_box_used, c) for c in selected_codes])
-        targets_infer = infer_scaled_targets_with_corner_surface_alignment(
+        targets_infer, targets_infer_scaled = infer_scaled_targets_with_corner_surface_alignment(
             src_box=src_box_used,
             dst_box=dst_box_infer,
             ee_world=ee_world,
@@ -796,6 +798,7 @@ def process_file(
         "dst_box_center_used": dst_box_used.center.copy(),
         "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
         "ee_targets_infer": targets_infer,
+        "ee_targets_infer_scaled": targets_infer_scaled,
         "dst_box_infer_center": dst_box_infer.center.copy(),
         "dst_box_infer_size": dst_box_infer.size.copy(),
         "dst_box_infer_quat": dst_box_infer.quat_wxyz.copy(),
@@ -814,6 +817,7 @@ def _visualize_before_after(
     ee_after: np.ndarray,
     ee_targets: np.ndarray,
     ee_targets_infer: np.ndarray | None = None,
+    ee_targets_infer_scaled: np.ndarray | None = None,
     dst_box_infer: BoxFrame | None = None,
     src_corners_selected: np.ndarray | None = None,
     dst_corners_selected: np.ndarray | None = None,
@@ -954,6 +958,14 @@ def _visualize_before_after(
                 f"/pts/intermediate_target_{i}",
                 radius=0.018,
                 color=(230, 180, 80),
+                position=tuple(p),
+            )
+    if ee_targets_infer_scaled is not None:
+        for i, p in enumerate(ee_targets_infer_scaled):
+            server.scene.add_icosphere(
+                f"/pts/intermediate_scaled_{i}",
+                radius=0.016,
+                color=(120, 220, 120),
                 position=tuple(p),
             )
     if src_corners_selected is not None:
@@ -1219,6 +1231,9 @@ def main() -> None:
             quat_wxyz=viz_payload["dst_box_quat_used"],
         )
         ee_targets_infer_viz = np.asarray(viz_payload.get("ee_targets_infer", np.empty((0, 3), dtype=np.float64)))
+        ee_targets_infer_scaled_viz = np.asarray(
+            viz_payload.get("ee_targets_infer_scaled", np.empty((0, 3), dtype=np.float64))
+        )
         src_corners_selected_viz = np.asarray(viz_payload.get("src_corners_selected", np.empty((0, 3), dtype=np.float64)))
         dst_corners_selected_viz = np.asarray(viz_payload.get("dst_corners_selected", np.empty((0, 3), dtype=np.float64)))
         dst_box_infer_viz = None
@@ -1238,6 +1253,7 @@ def main() -> None:
             ee_after=viz_payload["ee_after"],
             ee_targets=viz_payload["ee_targets"],
             ee_targets_infer=ee_targets_infer_viz if ee_targets_infer_viz.size > 0 else None,
+            ee_targets_infer_scaled=ee_targets_infer_scaled_viz if ee_targets_infer_scaled_viz.size > 0 else None,
             dst_box_infer=dst_box_infer_viz,
             src_corners_selected=src_corners_selected_viz if src_corners_selected_viz.size > 0 else None,
             dst_corners_selected=dst_corners_selected_viz if dst_corners_selected_viz.size > 0 else None,
