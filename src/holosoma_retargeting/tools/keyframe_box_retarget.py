@@ -9,7 +9,10 @@ from typing import Sequence
 import mujoco  # type: ignore[import-not-found]
 import numpy as np
 
-default_box_size = np.array([0.35, 0.35, 0.35], dtype=np.float64)
+default_box_size = np.array([0.3, 0.3, 0.3], dtype=np.float64)
+OBJECT_X_ROTATE_DEG_CLOCKWISE = 0.0
+OBJECT_Y_ROTATE_DEG_CLOCKWISE = 0.0
+OBJECT_Z_ROTATE_DEG_CLOCKWISE = 0.0
 
 
 def _parse_vec3(text: str) -> np.ndarray:
@@ -58,6 +61,36 @@ def _quat_wxyz_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 def _quat_wxyz_conj(q: np.ndarray) -> np.ndarray:
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
+
+
+def _quat_axis_clockwise_deg(axis: str, deg: float) -> np.ndarray:
+    """Clockwise about +axis means negative angle by right-hand rule."""
+    rad = -np.deg2rad(float(deg))
+    c = np.cos(rad / 2.0)
+    s = np.sin(rad / 2.0)
+    if axis == "x":
+        return np.array([c, s, 0.0, 0.0], dtype=np.float64)
+    if axis == "y":
+        return np.array([c, 0.0, s, 0.0], dtype=np.float64)
+    if axis == "z":
+        return np.array([c, 0.0, 0.0, s], dtype=np.float64)
+    raise ValueError(f"Unsupported axis: {axis}")
+
+
+def _apply_local_box_rotation_offsets(
+    q_wxyz: np.ndarray,
+    rotate_x_deg_clockwise: float,
+    rotate_y_deg_clockwise: float,
+    rotate_z_deg_clockwise: float,
+) -> np.ndarray:
+    q = np.asarray(q_wxyz, dtype=np.float64).copy()
+    if rotate_x_deg_clockwise != 0.0:
+        q = _quat_wxyz_multiply(q, _quat_axis_clockwise_deg("x", rotate_x_deg_clockwise))
+    if rotate_y_deg_clockwise != 0.0:
+        q = _quat_wxyz_multiply(q, _quat_axis_clockwise_deg("y", rotate_y_deg_clockwise))
+    if rotate_z_deg_clockwise != 0.0:
+        q = _quat_wxyz_multiply(q, _quat_axis_clockwise_deg("z", rotate_z_deg_clockwise))
+    return q / max(np.linalg.norm(q), 1e-12)
 
 
 def _yaw_only_quat_from_wxyz(q: np.ndarray) -> np.ndarray:
@@ -269,26 +302,125 @@ def update_npz_kinematics(data_dict: dict[str, np.ndarray], model: mujoco.MjMode
     data.qpos[:] = q
     mujoco.mj_forward(model, data)
 
-    data_dict["qpos"] = q[None, :].astype(np.float64 if data_dict.get("qpos", q[None]).dtype == np.float64 else np.float32)
+    qpos_prev = data_dict.get("qpos")
+    if qpos_prev is None:
+        data_dict["qpos"] = q.astype(np.float32)
+    else:
+        qpos_prev = np.asarray(qpos_prev)
+        qpos_dtype = np.float64 if qpos_prev.dtype == np.float64 else np.float32
+        if qpos_prev.ndim == 2:
+            data_dict["qpos"] = q[None, :].astype(qpos_dtype)
+        else:
+            data_dict["qpos"] = q.astype(qpos_dtype)
 
     if "dof_positions" in data_dict:
-        n = data_dict["dof_positions"].shape[-1]
-        data_dict["dof_positions"] = q[7 : 7 + n][None, :].astype(data_dict["dof_positions"].dtype)
+        dof_prev = np.asarray(data_dict["dof_positions"])
+        n = dof_prev.shape[-1]
+        dof_new = q[7 : 7 + n].astype(dof_prev.dtype)
+        if dof_prev.ndim == 2:
+            data_dict["dof_positions"] = dof_new[None, :]
+        else:
+            data_dict["dof_positions"] = dof_new
 
     if "body_positions" in data_dict and "body_names" in data_dict:
         body_names = [str(x) for x in data_dict["body_names"]]
-        out_pos = data_dict["body_positions"].copy()
+        out_pos = np.asarray(data_dict["body_positions"]).copy()
         out_rot = data_dict.get("body_rotations", None)
         for i, name in enumerate(body_names):
             bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
             if bid < 0:
                 continue
-            out_pos[0, i] = data.xpos[bid]
+            if out_pos.ndim == 3:
+                out_pos[0, i] = data.xpos[bid]
+            else:
+                out_pos[i] = data.xpos[bid]
             if out_rot is not None:
-                out_rot[0, i] = data.xquat[bid]
+                if out_rot.ndim == 3:
+                    out_rot[0, i] = data.xquat[bid]
+                else:
+                    out_rot[i] = data.xquat[bid]
         data_dict["body_positions"] = out_pos.astype(data_dict["body_positions"].dtype)
         if out_rot is not None:
             data_dict["body_rotations"] = out_rot.astype(data_dict["body_rotations"].dtype)
+
+
+def _read_first_frame(arr: np.ndarray, value_ndim: int) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == value_ndim + 1:
+        return arr[0]
+    return arr
+
+
+def _extract_object_pose_from_payload(payload: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray] | None:
+    pos = None
+    quat = None
+    if "object_position_xyz" in payload:
+        pos = np.asarray(payload["object_position_xyz"], dtype=np.float64).reshape(-1)
+    elif "object_pose" in payload:
+        pose = np.asarray(payload["object_pose"], dtype=np.float64).reshape(-1)
+        if pose.size >= 3:
+            pos = pose[:3]
+        if pose.size >= 7:
+            quat = pose[3:7]
+
+    if "object_quat_wxyz" in payload:
+        quat = np.asarray(payload["object_quat_wxyz"], dtype=np.float64).reshape(-1)
+    elif "object_orientation" in payload:
+        quat = np.asarray(payload["object_orientation"], dtype=np.float64).reshape(-1)
+
+    if pos is None or quat is None or pos.size < 3 or quat.size < 4:
+        return None
+
+    quat = quat[:4]
+    qn = np.linalg.norm(quat)
+    if qn < 1e-12:
+        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        quat = quat / qn
+    return pos[:3], quat
+
+
+def _build_qpos_from_keyframe_payload(payload: dict[str, np.ndarray], model: mujoco.MjModel) -> np.ndarray:
+    q0 = np.zeros(model.nq, dtype=np.float64)
+    if model.nq >= 7:
+        q0[3] = 1.0
+
+    if "body_positions" in payload and "body_rotations" in payload and "body_names" in payload:
+        body_positions = _read_first_frame(payload["body_positions"], value_ndim=2)
+        body_rotations = _read_first_frame(payload["body_rotations"], value_ndim=2)
+        body_names = [str(x) for x in payload["body_names"]]
+        root_idx = None
+        for candidate in ("pelvis", "base_link", "torso_link"):
+            if candidate in body_names:
+                root_idx = body_names.index(candidate)
+                break
+        if root_idx is None and body_names:
+            root_idx = 0
+        if root_idx is not None:
+            q0[0:3] = np.asarray(body_positions[root_idx], dtype=np.float64)
+            q0[3:7] = np.asarray(body_rotations[root_idx], dtype=np.float64)
+
+    if "dof_positions" in payload:
+        dof_positions = _read_first_frame(payload["dof_positions"], value_ndim=1).astype(np.float64, copy=False).reshape(-1)
+        dof_names = [str(x) for x in payload.get("dof_names", [])]
+        if dof_names and len(dof_names) == len(dof_positions):
+            for name, val in zip(dof_names, dof_positions):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                if jid < 0:
+                    continue
+                qadr = int(model.jnt_qposadr[jid])
+                q0[qadr] = float(val)
+        else:
+            n = min(len(dof_positions), max(model.nq - 7, 0))
+            q0[7 : 7 + n] = dof_positions[:n]
+
+    qn = np.linalg.norm(q0[3:7]) if model.nq >= 7 else 1.0
+    if model.nq >= 7:
+        if qn < 1e-12:
+            q0[3:7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            q0[3:7] /= qn
+    return q0
 
 
 def process_file(
@@ -303,17 +435,26 @@ def process_file(
     match_box_relative_base_z: bool = False,
     ground_z: float = 0.0,
     align_box_with_robot_yaw: bool = False,
+    apply_box_rotation: bool = True,
+    box_rotate_x_deg_clockwise: float = OBJECT_X_ROTATE_DEG_CLOCKWISE,
+    box_rotate_y_deg_clockwise: float = OBJECT_Y_ROTATE_DEG_CLOCKWISE,
+    box_rotate_z_deg_clockwise: float = OBJECT_Z_ROTATE_DEG_CLOCKWISE,
+    retarget: bool = True,
     debug: bool = False,
 ) -> dict[str, np.ndarray]:
     with np.load(input_file, allow_pickle=True) as npz:
         payload = {k: npz[k] for k in npz.files}
 
-    if "qpos" not in payload:
-        raise ValueError(f"{input_file} missing qpos")
-    qpos = np.asarray(payload["qpos"])
-    if qpos.ndim != 2 or qpos.shape[0] < 1:
-        raise ValueError(f"Expected qpos shape (T, D), got {qpos.shape}")
-    q0 = qpos[0].astype(np.float64)
+    if "qpos" in payload:
+        qpos = np.asarray(payload["qpos"])
+        if qpos.ndim == 1:
+            q0 = qpos.astype(np.float64)
+        elif qpos.ndim == 2 and qpos.shape[0] >= 1:
+            q0 = qpos[0].astype(np.float64)
+        else:
+            raise ValueError(f"Expected qpos shape (D,) or (T, D), got {qpos.shape}")
+    else:
+        q0 = _build_qpos_from_keyframe_payload(payload, model)
 
     data = mujoco.MjData(model)
     data.qpos[:] = q0
@@ -342,22 +483,72 @@ def process_file(
 
     ee_world = np.vstack([_get_body_pos(data, bid) for bid in body_ids])
     robot_yaw_quat = _yaw_only_quat_from_wxyz(q0[3:7])
-    src_box_used = src_box if src_box is not None else infer_source_box_from_ee(ee_world, dst_box)
+    object_pose = _extract_object_pose_from_payload(payload)
+    if object_pose is not None:
+        object_pos, object_quat = object_pose
+        if apply_box_rotation:
+            # Apply in box local/root frame (intrinsic rotations): q_new = q_obj * q_offset.
+            object_quat = _apply_local_box_rotation_offsets(
+                object_quat,
+                rotate_x_deg_clockwise=box_rotate_x_deg_clockwise,
+                rotate_y_deg_clockwise=box_rotate_y_deg_clockwise,
+                rotate_z_deg_clockwise=box_rotate_z_deg_clockwise,
+            )
+        src_box_used = BoxFrame(
+            center=object_pos.copy(),
+            size=src_box.size.copy() if src_box is not None else default_box_size.copy(),
+            quat_wxyz=object_quat.copy(),
+        )
+        dst_box_used = BoxFrame(
+            center=object_pos.copy(),
+            size=dst_box.size.copy(),
+            quat_wxyz=object_quat.copy(),
+        )
+        if apply_box_rotation:
+            if "object_quat_wxyz" in payload:
+                oq = np.asarray(payload["object_quat_wxyz"])
+                payload["object_quat_wxyz"] = object_quat.astype(oq.dtype)
+            if "object_orientation" in payload:
+                oo = np.asarray(payload["object_orientation"])
+                payload["object_orientation"] = object_quat.astype(oo.dtype)
+    else:
+        src_box_used = src_box if src_box is not None else infer_source_box_from_ee(ee_world, dst_box)
+        dst_box_used = dst_box
+        if dst_box_used.center is None:
+            dst_box_used = BoxFrame(center=src_box_used.center.copy(), size=dst_box.size.copy(), quat_wxyz=dst_box.quat_wxyz.copy())
+
     if align_box_with_robot_yaw:
         src_box_used = BoxFrame(
             center=src_box_used.center.copy(),
             size=src_box_used.size.copy(),
             quat_wxyz=robot_yaw_quat.copy(),
         )
-    dst_box_used = dst_box
-    if dst_box_used.center is None:
-        dst_box_used = BoxFrame(center=src_box_used.center.copy(), size=dst_box.size.copy(), quat_wxyz=dst_box.quat_wxyz.copy())
     if align_box_with_robot_yaw:
         dst_box_used = BoxFrame(
             center=dst_box_used.center.copy(),
             size=dst_box_used.size.copy(),
             quat_wxyz=robot_yaw_quat.copy(),
         )
+
+    if not retarget:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(output_file, **payload)
+        if debug:
+            print(f"[{input_file.name}]")
+            print("  mode: overwrite-rotation-only (skip IK and robot/body updates)")
+            print(f"  wrote: {output_file}")
+        return {
+            "q_before": q0.copy(),
+            "q_after": q0.copy(),
+            "ee_before": ee_world.copy(),
+            "ee_after": ee_world.copy(),
+            "ee_targets": ee_world.copy(),
+            "src_box_center_used": src_box_used.center.copy(),
+            "src_box_size_used": src_box_used.size.copy(),
+            "src_box_quat_used": src_box_used.quat_wxyz.copy(),
+            "dst_box_center_used": dst_box_used.center.copy(),
+            "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
+        }
 
     targets = infer_scaled_targets(src_box_used, dst_box_used, ee_world)
     q_init = q0.copy()
@@ -506,6 +697,20 @@ def _visualize_before_after(
         0.25,
         center_override=dst_box_viz_center,
     )
+    server.scene.add_frame(
+        "/box/source_axis",
+        position=tuple(src_box_viz_center + np.array([-0.8, 0.0, 0.0], dtype=np.float64)),
+        wxyz=tuple(src_box.quat_wxyz),
+        axes_length=0.18,
+        axes_radius=0.01,
+    )
+    server.scene.add_frame(
+        "/box/target_axis",
+        position=tuple(dst_box_viz_center + np.array([0.8, 0.0, 0.0], dtype=np.float64)),
+        wxyz=tuple(dst_box.quat_wxyz),
+        axes_length=0.18,
+        axes_radius=0.01,
+    )
 
     # Mark EE and target points
     for i, p in enumerate(ee_before):
@@ -541,7 +746,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--input", type=Path, help="Single input npz file.")
     p.add_argument("--input-dir", type=Path, help="Directory of npz keyframe files.")
-    p.add_argument("--output-dir", type=Path, required=True, help="Output directory for updated npz files.")
+    p.add_argument("--output-dir", type=Path, help="Output directory for updated npz files.")
+    p.add_argument(
+        "--overwrite-input",
+        action="store_true",
+        help="Overwrite input npz files in place instead of writing to --output-dir.",
+    )
     p.add_argument("--robot-xml", type=Path, help="MuJoCo XML model path. Defaults to g1 preset XML.")
     p.add_argument("--robot", default="g1", choices=["g1", "t1"], help="Robot preset used when --robot-xml is omitted.")
     p.add_argument(
@@ -599,6 +809,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--visualize", action="store_true", help="Open a Viser viewer for before/after comparison.")
     p.add_argument(
+        "--box-rotate-x-deg-clockwise",
+        type=float,
+        default=OBJECT_X_ROTATE_DEG_CLOCKWISE,
+        help="Local box-frame clockwise rotation offset around x (deg) applied to object orientation.",
+    )
+    p.add_argument(
+        "--box-rotate-y-deg-clockwise",
+        type=float,
+        default=OBJECT_Y_ROTATE_DEG_CLOCKWISE,
+        help="Local box-frame clockwise rotation offset around y (deg) applied to object orientation.",
+    )
+    p.add_argument(
+        "--box-rotate-z-deg-clockwise",
+        type=float,
+        default=OBJECT_Z_ROTATE_DEG_CLOCKWISE,
+        help="Local box-frame clockwise rotation offset around z (deg) applied to object orientation.",
+    )
+    p.add_argument(
         "--visualize-file",
         type=str,
         help="For --input-dir runs, visualize this filename (default: first processed file).",
@@ -610,16 +838,16 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if not args.input and not args.input_dir:
         raise ValueError("Provide --input or --input-dir")
+    if args.overwrite_input and args.output_dir is None:
+        raise ValueError("When using --overwrite-input, also provide --output-dir for retargeted outputs.")
+    if not args.overwrite_input and args.output_dir is None:
+        raise ValueError("Provide --output-dir, or use --overwrite-input.")
 
     robot_xml = args.robot_xml or _default_robot_xml(args.robot)
     robot_urdf = _default_robot_urdf(args.robot)
     model = mujoco.MjModel.from_xml_path(str(robot_xml))
     ee_bodies = args.ee_bodies or _pick_existing_default_ee(model)
     foot_bodies = args.foot_bodies or _pick_existing_default_feet(model)
-    
-
-    if not args.infer_src_box and args.src_box_center is None:
-        raise ValueError("Provide --src-box-center, or use --infer-src-box")
 
     src_box = None
     if args.src_box_center is not None:
@@ -647,21 +875,67 @@ def main() -> None:
     viz_payload: dict[str, np.ndarray] | None = None
     viz_name = args.visualize_file
     for in_file in inputs:
-        out_file = args.output_dir / in_file.name
-        ret = process_file(
-            input_file=in_file,
-            output_file=out_file,
-            model=model,
-            ee_bodies=ee_bodies,
-            foot_bodies=foot_bodies,
-            src_box=src_box,
-            dst_box=dst_box,
-            match_box_relative_base=not args.no_match_box_relative_base,
-            match_box_relative_base_z=args.match_box_relative_base_z,
-            ground_z=args.ground_z,
-            align_box_with_robot_yaw=args.align_box_with_robot_yaw,
-            debug=args.debug,
-        )
+        if args.overwrite_input:
+            # 1) Overwrite original input with box-rotation-only payload.
+            process_file(
+                input_file=in_file,
+                output_file=in_file,
+                model=model,
+                ee_bodies=ee_bodies,
+                foot_bodies=foot_bodies,
+                src_box=src_box,
+                dst_box=dst_box,
+                match_box_relative_base=not args.no_match_box_relative_base,
+                match_box_relative_base_z=args.match_box_relative_base_z,
+                ground_z=args.ground_z,
+                align_box_with_robot_yaw=args.align_box_with_robot_yaw,
+                apply_box_rotation=True,
+                box_rotate_x_deg_clockwise=args.box_rotate_x_deg_clockwise,
+                box_rotate_y_deg_clockwise=args.box_rotate_y_deg_clockwise,
+                box_rotate_z_deg_clockwise=args.box_rotate_z_deg_clockwise,
+                retarget=False,
+                debug=args.debug,
+            )
+            # 2) Save full retargeted result to output-dir from rotated input.
+            ret = process_file(
+                input_file=in_file,
+                output_file=args.output_dir / in_file.name,
+                model=model,
+                ee_bodies=ee_bodies,
+                foot_bodies=foot_bodies,
+                src_box=src_box,
+                dst_box=dst_box,
+                match_box_relative_base=not args.no_match_box_relative_base,
+                match_box_relative_base_z=args.match_box_relative_base_z,
+                ground_z=args.ground_z,
+                align_box_with_robot_yaw=args.align_box_with_robot_yaw,
+                apply_box_rotation=False,
+                box_rotate_x_deg_clockwise=args.box_rotate_x_deg_clockwise,
+                box_rotate_y_deg_clockwise=args.box_rotate_y_deg_clockwise,
+                box_rotate_z_deg_clockwise=args.box_rotate_z_deg_clockwise,
+                retarget=True,
+                debug=args.debug,
+            )
+        else:
+            ret = process_file(
+                input_file=in_file,
+                output_file=args.output_dir / in_file.name,
+                model=model,
+                ee_bodies=ee_bodies,
+                foot_bodies=foot_bodies,
+                src_box=src_box,
+                dst_box=dst_box,
+                match_box_relative_base=not args.no_match_box_relative_base,
+                match_box_relative_base_z=args.match_box_relative_base_z,
+                ground_z=args.ground_z,
+                align_box_with_robot_yaw=args.align_box_with_robot_yaw,
+                apply_box_rotation=True,
+                box_rotate_x_deg_clockwise=args.box_rotate_x_deg_clockwise,
+                box_rotate_y_deg_clockwise=args.box_rotate_y_deg_clockwise,
+                box_rotate_z_deg_clockwise=args.box_rotate_z_deg_clockwise,
+                retarget=True,
+                debug=args.debug,
+            )
         if args.visualize and viz_payload is None and (viz_name is None or in_file.name == viz_name):
             viz_payload = ret
 
