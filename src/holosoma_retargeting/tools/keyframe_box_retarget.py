@@ -29,6 +29,13 @@ def _parse_body_names(text: str) -> list[str]:
     return names
 
 
+def _parse_quat_wxyz(text: str) -> np.ndarray:
+    vals = [float(x) for x in text.split(",")]
+    if len(vals) != 4:
+        raise argparse.ArgumentTypeError(f"Expected 4 comma-separated values, got: {text}")
+    return np.asarray(vals, dtype=np.float64)
+
+
 def _quat_wxyz_to_rotmat(q: np.ndarray) -> np.ndarray:
     w, x, y, z = q
     n = np.linalg.norm(q)
@@ -63,6 +70,14 @@ def _quat_wxyz_conj(q: np.ndarray) -> np.ndarray:
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
 
 
+def _quat_wxyz_normalize(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return q / n
+
+
 def _quat_axis_clockwise_deg(axis: str, deg: float) -> np.ndarray:
     """Clockwise about +axis means negative angle by right-hand rule."""
     rad = -np.deg2rad(float(deg))
@@ -91,6 +106,20 @@ def _apply_local_box_rotation_offsets(
     if rotate_z_deg_clockwise != 0.0:
         q = _quat_wxyz_multiply(q, _quat_axis_clockwise_deg("z", rotate_z_deg_clockwise))
     return q / max(np.linalg.norm(q), 1e-12)
+
+
+def map_points_by_frame_transform(
+    src_pos: np.ndarray,
+    src_quat_wxyz: np.ndarray,
+    dst_pos: np.ndarray,
+    dst_quat_wxyz: np.ndarray,
+    pts_world: np.ndarray,
+) -> np.ndarray:
+    """Transform world points by preserving local coordinates in src frame, then reconstructing in dst frame."""
+    src_rot = _quat_wxyz_to_rotmat(_quat_wxyz_normalize(src_quat_wxyz))
+    dst_rot = _quat_wxyz_to_rotmat(_quat_wxyz_normalize(dst_quat_wxyz))
+    local = (pts_world - src_pos) @ src_rot
+    return local @ dst_rot.T + dst_pos
 
 
 def _yaw_only_quat_from_wxyz(q: np.ndarray) -> np.ndarray:
@@ -431,6 +460,9 @@ def process_file(
     foot_bodies: list[str] | None,
     src_box: BoxFrame | None,
     dst_box: BoxFrame,
+    no_object_retarget: bool = False,
+    target_root_pos: np.ndarray | None = None,
+    target_root_quat_wxyz: np.ndarray | None = None,
     match_box_relative_base: bool = True,
     match_box_relative_base_z: bool = False,
     ground_z: float = 0.0,
@@ -483,39 +515,49 @@ def process_file(
 
     ee_world = np.vstack([_get_body_pos(data, bid) for bid in body_ids])
     robot_yaw_quat = _yaw_only_quat_from_wxyz(q0[3:7])
-    object_pose = _extract_object_pose_from_payload(payload)
-    if object_pose is not None:
-        object_pos, object_quat = object_pose
-        if apply_box_rotation:
-            # Apply in box local/root frame (intrinsic rotations): q_new = q_obj * q_offset.
-            object_quat = _apply_local_box_rotation_offsets(
-                object_quat,
-                rotate_x_deg_clockwise=box_rotate_x_deg_clockwise,
-                rotate_y_deg_clockwise=box_rotate_y_deg_clockwise,
-                rotate_z_deg_clockwise=box_rotate_z_deg_clockwise,
-            )
-        src_box_used = BoxFrame(
-            center=object_pos.copy(),
-            size=src_box.size.copy() if src_box is not None else default_box_size.copy(),
-            quat_wxyz=object_quat.copy(),
-        )
-        dst_box_used = BoxFrame(
-            center=object_pos.copy(),
-            size=dst_box.size.copy(),
-            quat_wxyz=object_quat.copy(),
-        )
-        if apply_box_rotation:
-            if "object_quat_wxyz" in payload:
-                oq = np.asarray(payload["object_quat_wxyz"])
-                payload["object_quat_wxyz"] = object_quat.astype(oq.dtype)
-            if "object_orientation" in payload:
-                oo = np.asarray(payload["object_orientation"])
-                payload["object_orientation"] = object_quat.astype(oo.dtype)
+    if no_object_retarget:
+        if target_root_pos is None or target_root_quat_wxyz is None:
+            raise ValueError("No-object retarget mode requires target_root_pos and target_root_quat_wxyz.")
+        src_root_pos = q0[0:3].copy()
+        src_root_quat = _quat_wxyz_normalize(q0[3:7].copy())
+        dst_root_pos = np.asarray(target_root_pos, dtype=np.float64).copy()
+        dst_root_quat = _quat_wxyz_normalize(np.asarray(target_root_quat_wxyz, dtype=np.float64).copy())
+        src_box_used = BoxFrame(center=src_root_pos, size=default_box_size.copy(), quat_wxyz=src_root_quat)
+        dst_box_used = BoxFrame(center=dst_root_pos, size=default_box_size.copy(), quat_wxyz=dst_root_quat)
     else:
-        src_box_used = src_box if src_box is not None else infer_source_box_from_ee(ee_world, dst_box)
-        dst_box_used = dst_box
-        if dst_box_used.center is None:
-            dst_box_used = BoxFrame(center=src_box_used.center.copy(), size=dst_box.size.copy(), quat_wxyz=dst_box.quat_wxyz.copy())
+        object_pose = _extract_object_pose_from_payload(payload)
+        if object_pose is not None:
+            object_pos, object_quat = object_pose
+            if apply_box_rotation:
+                # Apply in box local/root frame (intrinsic rotations): q_new = q_obj * q_offset.
+                object_quat = _apply_local_box_rotation_offsets(
+                    object_quat,
+                    rotate_x_deg_clockwise=box_rotate_x_deg_clockwise,
+                    rotate_y_deg_clockwise=box_rotate_y_deg_clockwise,
+                    rotate_z_deg_clockwise=box_rotate_z_deg_clockwise,
+                )
+            src_box_used = BoxFrame(
+                center=object_pos.copy(),
+                size=src_box.size.copy() if src_box is not None else default_box_size.copy(),
+                quat_wxyz=object_quat.copy(),
+            )
+            dst_box_used = BoxFrame(
+                center=object_pos.copy(),
+                size=dst_box.size.copy(),
+                quat_wxyz=object_quat.copy(),
+            )
+            if apply_box_rotation:
+                if "object_quat_wxyz" in payload:
+                    oq = np.asarray(payload["object_quat_wxyz"])
+                    payload["object_quat_wxyz"] = object_quat.astype(oq.dtype)
+                if "object_orientation" in payload:
+                    oo = np.asarray(payload["object_orientation"])
+                    payload["object_orientation"] = object_quat.astype(oo.dtype)
+        else:
+            src_box_used = src_box if src_box is not None else infer_source_box_from_ee(ee_world, dst_box)
+            dst_box_used = dst_box
+            if dst_box_used.center is None:
+                dst_box_used = BoxFrame(center=src_box_used.center.copy(), size=dst_box.size.copy(), quat_wxyz=dst_box.quat_wxyz.copy())
 
     if align_box_with_robot_yaw:
         src_box_used = BoxFrame(
@@ -550,10 +592,23 @@ def process_file(
             "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
         }
 
-    targets = infer_scaled_targets(src_box_used, dst_box_used, ee_world)
+    if no_object_retarget:
+        targets = map_points_by_frame_transform(
+            src_pos=src_box_used.center,
+            src_quat_wxyz=src_box_used.quat_wxyz,
+            dst_pos=dst_box_used.center,
+            dst_quat_wxyz=dst_box_used.quat_wxyz,
+            pts_world=ee_world,
+        )
+    else:
+        targets = infer_scaled_targets(src_box_used, dst_box_used, ee_world)
     q_init = q0.copy()
     base_before = q0[0:3].copy()
-    if match_box_relative_base:
+    base_quat_before = q0[3:7].copy()
+    if no_object_retarget:
+        q_init[0:3] = dst_box_used.center
+        q_init[3:7] = dst_box_used.quat_wxyz
+    elif match_box_relative_base:
         mapped = map_point_by_box_corner_reference(src_box_used, dst_box_used, base_before)
         q_init[0:2] = mapped[0:2]
         if match_box_relative_base_z:
@@ -589,7 +644,10 @@ def process_file(
             print(f"  inferred dst box center: {dst_box_used.center}")
         if align_box_with_robot_yaw:
             print(f"  aligned box yaw to robot (quat wxyz): {robot_yaw_quat}")
-        if match_box_relative_base:
+        if no_object_retarget:
+            print(f"  no-object mode root target pos: {base_before} -> {q_init[0:3]}")
+            print(f"  no-object mode root target quat: {base_quat_before} -> {q_init[3:7]}")
+        elif match_box_relative_base:
             print(f"  base shift (corner-referenced): {base_before} -> {q_init[0:3]}")
         if foot_ids:
             print(f"  grounded feet: {len(foot_ids)} bodies, ground_z={ground_z:.3f}, xy_sliding=True")
@@ -765,15 +823,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dst-box-size", type=_parse_vec3, required=True, help="Target box size (sx,sy,sz).")
     p.add_argument(
         "--src-box-quat-wxyz",
-        type=lambda s: np.asarray([float(x) for x in s.split(",")], dtype=np.float64),
+        type=_parse_quat_wxyz,
         default=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
         help="Source box orientation quaternion w,x,y,z (default identity).",
     )
     p.add_argument(
         "--dst-box-quat-wxyz",
-        type=lambda s: np.asarray([float(x) for x in s.split(",")], dtype=np.float64),
-        default=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        type=_parse_quat_wxyz,
+        default=np.array([ 0.383, 0.0, 0.0, 0.924 ], dtype=np.float64),
         help="Target box orientation quaternion w,x,y,z (default identity).",
+    )
+    p.add_argument(
+        "--no-object-retarget",
+        action="store_true",
+        help="Retarget without object mapping; use target root pose/orientation instead.",
+    )
+    p.add_argument(
+        "--target-root-pos",
+        type=_parse_vec3,
+        help="Target root/base position (x,y,z) used by --no-object-retarget.",
+    )
+    p.add_argument(
+        "--target-root-quat-wxyz",
+        type=_parse_quat_wxyz,
+        help="Target root/base quaternion w,x,y,z used by --no-object-retarget.",
     )
     p.add_argument("--debug", action="store_true", help="Print detailed per-file diagnostics.")
     p.add_argument(
@@ -842,6 +915,8 @@ def main() -> None:
         raise ValueError("When using --overwrite-input, also provide --output-dir for retargeted outputs.")
     if not args.overwrite_input and args.output_dir is None:
         raise ValueError("Provide --output-dir, or use --overwrite-input.")
+    if args.no_object_retarget and (args.target_root_pos is None or args.target_root_quat_wxyz is None):
+        raise ValueError("--no-object-retarget requires both --target-root-pos and --target-root-quat-wxyz.")
 
     robot_xml = args.robot_xml or _default_robot_xml(args.robot)
     robot_urdf = _default_robot_urdf(args.robot)
@@ -885,6 +960,9 @@ def main() -> None:
                 foot_bodies=foot_bodies,
                 src_box=src_box,
                 dst_box=dst_box,
+                no_object_retarget=args.no_object_retarget,
+                target_root_pos=args.target_root_pos,
+                target_root_quat_wxyz=args.target_root_quat_wxyz,
                 match_box_relative_base=not args.no_match_box_relative_base,
                 match_box_relative_base_z=args.match_box_relative_base_z,
                 ground_z=args.ground_z,
@@ -905,6 +983,9 @@ def main() -> None:
                 foot_bodies=foot_bodies,
                 src_box=src_box,
                 dst_box=dst_box,
+                no_object_retarget=args.no_object_retarget,
+                target_root_pos=args.target_root_pos,
+                target_root_quat_wxyz=args.target_root_quat_wxyz,
                 match_box_relative_base=not args.no_match_box_relative_base,
                 match_box_relative_base_z=args.match_box_relative_base_z,
                 ground_z=args.ground_z,
@@ -925,6 +1006,9 @@ def main() -> None:
                 foot_bodies=foot_bodies,
                 src_box=src_box,
                 dst_box=dst_box,
+                no_object_retarget=args.no_object_retarget,
+                target_root_pos=args.target_root_pos,
+                target_root_quat_wxyz=args.target_root_quat_wxyz,
                 match_box_relative_base=not args.no_match_box_relative_base,
                 match_box_relative_base_z=args.match_box_relative_base_z,
                 ground_z=args.ground_z,
