@@ -122,6 +122,19 @@ def map_points_by_frame_transform(
     return local @ dst_rot.T + dst_pos
 
 
+def map_orientation_by_frame_transform(
+    src_quat_wxyz: np.ndarray,
+    dst_quat_wxyz: np.ndarray,
+    quat_wxyz: np.ndarray,
+) -> np.ndarray:
+    """Rotate an orientation by the world-frame transform that maps src frame to dst frame."""
+    src_q = _quat_wxyz_normalize(src_quat_wxyz)
+    dst_q = _quat_wxyz_normalize(dst_quat_wxyz)
+    q = _quat_wxyz_normalize(quat_wxyz)
+    delta_q = _quat_wxyz_multiply(dst_q, _quat_wxyz_conj(src_q))
+    return _quat_wxyz_normalize(_quat_wxyz_multiply(delta_q, q))
+
+
 def _yaw_only_quat_from_wxyz(q: np.ndarray) -> np.ndarray:
     """Extract world yaw (about z) from MuJoCo wxyz quaternion."""
     q = np.asarray(q, dtype=np.float64)
@@ -175,6 +188,65 @@ def infer_scaled_targets(src_box: BoxFrame, dst_box: BoxFrame, ee_world: np.ndar
     normalized = local / src_half
     dst_local = normalized * dst_box.half_extents
     return dst_box.local_to_world(dst_local)
+
+
+def _corner_codes() -> np.ndarray:
+    vals = (-1.0, 1.0)
+    return np.asarray([[sx, sy, sz] for sx in vals for sy in vals for sz in vals], dtype=np.float64)
+
+
+def _corner_world_from_code(box: BoxFrame, code: np.ndarray) -> np.ndarray:
+    local = np.asarray(code, dtype=np.float64) * box.half_extents
+    return box.local_to_world(local[None, :])[0]
+
+
+def _closest_corner_codes_for_ees(src_box: BoxFrame, ee_world: np.ndarray, robot_root: np.ndarray) -> np.ndarray:
+    codes = _corner_codes()
+    corners = np.vstack([_corner_world_from_code(src_box, c) for c in codes])  # (8,3)
+    out = []
+    for ee in ee_world:
+        cost = np.linalg.norm(corners - ee[None, :], axis=1) + np.linalg.norm(corners - robot_root[None, :], axis=1)
+        out.append(codes[int(np.argmin(cost))])
+    return np.asarray(out, dtype=np.float64)
+
+
+def infer_scaled_targets_with_corner_surface_alignment(
+    src_box: BoxFrame,
+    dst_box: BoxFrame,
+    ee_world: np.ndarray,
+    robot_root: np.ndarray,
+) -> np.ndarray:
+    """Scale EE targets, then slide on the current target-box surface to match source corner-relative direction/distance."""
+    if ee_world.size == 0:
+        return ee_world.copy()
+
+    scaled_world = infer_scaled_targets(src_box, dst_box, ee_world)
+    scaled_local = dst_box.world_to_local(scaled_world)
+    half = np.maximum(dst_box.half_extents, 1e-9)
+
+    corner_codes = _closest_corner_codes_for_ees(src_box, ee_world, robot_root)
+    out_local = scaled_local.copy()
+    for i in range(ee_world.shape[0]):
+        code = corner_codes[i]
+        src_corner = _corner_world_from_code(src_box, code)
+        dst_corner = _corner_world_from_code(dst_box, code)
+
+        # Desired corner-relative vector from source, transplanted to target corner.
+        desired_world = dst_corner + (ee_world[i] - src_corner)
+        desired_local = dst_box.world_to_local(desired_world[None, :])[0]
+
+        # Keep the EE on the same surface (face) as the initially scaled target.
+        norm = np.abs(out_local[i]) / half
+        face_axis = int(np.argmax(norm))
+        face_val = np.sign(out_local[i, face_axis]) * half[face_axis]
+        if abs(face_val) < 1e-12:
+            face_val = half[face_axis]
+
+        local = np.clip(desired_local, -half, half)
+        local[face_axis] = face_val
+        out_local[i] = local
+
+    return dst_box.local_to_world(out_local)
 
 
 def map_point_by_box_corner_reference(src_box: BoxFrame, dst_box: BoxFrame, point_world: np.ndarray) -> np.ndarray:
@@ -536,15 +608,16 @@ def process_file(
                     rotate_y_deg_clockwise=box_rotate_y_deg_clockwise,
                     rotate_z_deg_clockwise=box_rotate_z_deg_clockwise,
                 )
+            target_box_quat = _quat_wxyz_normalize(np.asarray(dst_box.quat_wxyz, dtype=np.float64))
             src_box_used = BoxFrame(
                 center=object_pos.copy(),
                 size=src_box.size.copy() if src_box is not None else default_box_size.copy(),
                 quat_wxyz=object_quat.copy(),
             )
             dst_box_used = BoxFrame(
-                center=object_pos.copy(),
+                center=dst_box.center.copy() if dst_box.center is not None else object_pos.copy(),
                 size=dst_box.size.copy(),
-                quat_wxyz=object_quat.copy(),
+                quat_wxyz=target_box_quat,
             )
             if apply_box_rotation:
                 if "object_quat_wxyz" in payload:
@@ -590,7 +663,24 @@ def process_file(
             "src_box_quat_used": src_box_used.quat_wxyz.copy(),
             "dst_box_center_used": dst_box_used.center.copy(),
             "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
+            "ee_targets_infer": np.empty((0, 3), dtype=np.float64),
+            "dst_box_infer_center": np.zeros(3, dtype=np.float64),
+            "dst_box_infer_size": np.zeros(3, dtype=np.float64),
+            "dst_box_infer_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+            "src_corners_selected": np.empty((0, 3), dtype=np.float64),
+            "dst_corners_selected": np.empty((0, 3), dtype=np.float64),
         }
+
+    base_before = q0[0:3].copy()
+    base_quat_before = q0[3:7].copy()
+    targets_infer = np.empty((0, 3), dtype=np.float64)
+    dst_box_infer = BoxFrame(
+        center=np.zeros(3, dtype=np.float64),
+        size=np.zeros(3, dtype=np.float64),
+        quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    )
+    src_corners_selected = np.empty((0, 3), dtype=np.float64)
+    dst_corners_selected = np.empty((0, 3), dtype=np.float64)
 
     if no_object_retarget:
         targets = map_points_by_frame_transform(
@@ -601,18 +691,54 @@ def process_file(
             pts_world=ee_world,
         )
     else:
-        targets = infer_scaled_targets(src_box_used, dst_box_used, ee_world)
+        # Stage 1: infer EE targets with source box orientation unchanged.
+        dst_box_infer = BoxFrame(
+            center=src_box_used.center.copy(),
+            size=dst_box_used.size.copy(),
+            quat_wxyz=src_box_used.quat_wxyz.copy(),
+        )
+        selected_codes = _closest_corner_codes_for_ees(src_box_used, ee_world, base_before)
+        src_corners_selected = np.vstack([_corner_world_from_code(src_box_used, c) for c in selected_codes])
+        dst_corners_selected = np.vstack([_corner_world_from_code(dst_box_used, c) for c in selected_codes])
+        targets_infer = infer_scaled_targets_with_corner_surface_alignment(
+            src_box=src_box_used,
+            dst_box=dst_box_infer,
+            ee_world=ee_world,
+            robot_root=base_before,
+        )
+        # Stage 2: rotate/translate box and robot together into final target box pose.
+        # ref_src = _edge_midpoint_world_from_code(dst_box_infer, closest_edge_code)
+        # ref_dst = _edge_midpoint_world_from_code(dst_box_used, closest_edge_code)
+        ref_src = dst_box_infer.center
+        ref_dst = dst_box_used.center
+        targets = map_points_by_frame_transform(
+            src_pos=ref_src,
+            src_quat_wxyz=dst_box_infer.quat_wxyz,
+            dst_pos=ref_dst,
+            dst_quat_wxyz=dst_box_used.quat_wxyz,
+            pts_world=targets_infer,
+        )
     q_init = q0.copy()
-    base_before = q0[0:3].copy()
-    base_quat_before = q0[3:7].copy()
     if no_object_retarget:
         q_init[0:3] = dst_box_used.center
         q_init[3:7] = dst_box_used.quat_wxyz
-    elif match_box_relative_base:
-        mapped = map_point_by_box_corner_reference(src_box_used, dst_box_used, base_before)
-        q_init[0:2] = mapped[0:2]
-        if match_box_relative_base_z:
+    else:
+        mapped = map_points_by_frame_transform(
+            src_pos=src_box_used.center,
+            src_quat_wxyz=src_box_used.quat_wxyz,
+            dst_pos=dst_box_used.center,
+            dst_quat_wxyz=dst_box_used.quat_wxyz,
+            pts_world=base_before[None, :],
+        )[0]
+        if match_box_relative_base:
+            q_init[0:2] = mapped[0:2]
+        if match_box_relative_base and match_box_relative_base_z:
             q_init[2] = mapped[2]
+        q_init[3:7] = map_orientation_by_frame_transform(
+            src_quat_wxyz=src_box_used.quat_wxyz,
+            dst_quat_wxyz=dst_box_used.quat_wxyz,
+            quat_wxyz=base_quat_before,
+        )
 
     q_new, residual = solve_multi_ee_ik(
         model,
@@ -647,8 +773,10 @@ def process_file(
         if no_object_retarget:
             print(f"  no-object mode root target pos: {base_before} -> {q_init[0:3]}")
             print(f"  no-object mode root target quat: {base_quat_before} -> {q_init[3:7]}")
-        elif match_box_relative_base:
-            print(f"  base shift (corner-referenced): {base_before} -> {q_init[0:3]}")
+        else:
+            if match_box_relative_base:
+                print(f"  base shift (frame-transform): {base_before} -> {q_init[0:3]}")
+            print(f"  base quat shift (frame-transform): {base_quat_before} -> {q_init[3:7]}")
         if foot_ids:
             print(f"  grounded feet: {len(foot_ids)} bodies, ground_z={ground_z:.3f}, xy_sliding=True")
         for name, cur, tgt in zip(ee_bodies, ee_world, targets):
@@ -667,6 +795,12 @@ def process_file(
         "src_box_quat_used": src_box_used.quat_wxyz.copy(),
         "dst_box_center_used": dst_box_used.center.copy(),
         "dst_box_quat_used": dst_box_used.quat_wxyz.copy(),
+        "ee_targets_infer": targets_infer,
+        "dst_box_infer_center": dst_box_infer.center.copy(),
+        "dst_box_infer_size": dst_box_infer.size.copy(),
+        "dst_box_infer_quat": dst_box_infer.quat_wxyz.copy(),
+        "src_corners_selected": src_corners_selected,
+        "dst_corners_selected": dst_corners_selected,
     }
 
 
@@ -679,6 +813,10 @@ def _visualize_before_after(
     ee_before: np.ndarray,
     ee_after: np.ndarray,
     ee_targets: np.ndarray,
+    ee_targets_infer: np.ndarray | None = None,
+    dst_box_infer: BoxFrame | None = None,
+    src_corners_selected: np.ndarray | None = None,
+    dst_corners_selected: np.ndarray | None = None,
 ) -> None:
     try:
         import viser  # type: ignore[import-not-found]
@@ -691,6 +829,7 @@ def _visualize_before_after(
     server = viser.ViserServer()
     server.scene.add_grid("/grid", width=4, height=4, position=(0.0, 0.0, 0.0))
     server.scene.add_label("/labels/before", "before", position=(-0.8, 0.0, 1.2))
+    server.scene.add_label("/labels/intermediate", "intermediate", position=(0.0, 0.0, 1.2))
     server.scene.add_label("/labels/after", "after", position=(0.8, 0.0, 1.2))
 
     urdf = yourdfpy.URDF.load(str(robot_urdf), load_meshes=True, build_scene_graph=True)
@@ -769,6 +908,23 @@ def _visualize_before_after(
         axes_length=0.18,
         axes_radius=0.01,
     )
+    if ee_targets_infer is not None and dst_box_infer is not None:
+        dst_box_infer_viz_center = ee_targets_infer.mean(axis=0) if ee_targets_infer.shape[0] >= 2 else dst_box_infer.center
+        _add_box_mesh(
+            "/box/intermediate",
+            dst_box_infer,
+            np.array([0.0, 0.0, 0.0], dtype=np.float64),
+            (200, 120, 80),
+            0.25,
+            center_override=dst_box_infer_viz_center,
+        )
+        server.scene.add_frame(
+            "/box/intermediate_axis",
+            position=tuple(dst_box_infer_viz_center),
+            wxyz=tuple(dst_box_infer.quat_wxyz),
+            axes_length=0.18,
+            axes_radius=0.01,
+        )
 
     # Mark EE and target points
     for i, p in enumerate(ee_before):
@@ -792,6 +948,30 @@ def _visualize_before_after(
             color=(80, 160, 255),
             position=tuple(p + np.array([0.8, 0, 0])),
         )
+    if ee_targets_infer is not None:
+        for i, p in enumerate(ee_targets_infer):
+            server.scene.add_icosphere(
+                f"/pts/intermediate_target_{i}",
+                radius=0.018,
+                color=(230, 180, 80),
+                position=tuple(p),
+            )
+    if src_corners_selected is not None:
+        for i, p in enumerate(src_corners_selected):
+            server.scene.add_icosphere(
+                f"/pts/src_corner_{i}",
+                radius=0.015,
+                color=(255, 90, 180),
+                position=tuple(p + np.array([-0.8, 0.0, 0.0], dtype=np.float64)),
+            )
+    if dst_corners_selected is not None:
+        for i, p in enumerate(dst_corners_selected):
+            server.scene.add_icosphere(
+                f"/pts/dst_corner_{i}",
+                radius=0.015,
+                color=(90, 220, 220),
+                position=tuple(p + np.array([0.8, 0.0, 0.0], dtype=np.float64)),
+            )
 
     print("Open the Viser URL shown above to inspect before/after retargeting. Press Ctrl+C to exit.")
     while True:
@@ -830,7 +1010,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dst-box-quat-wxyz",
         type=_parse_quat_wxyz,
-        default=np.array([ 0.383, 0.0, 0.0, 0.924 ], dtype=np.float64),
+        default=np.array([ 0.0, -0.545,  0.839, 0.0 ], dtype=np.float64),
         help="Target box orientation quaternion w,x,y,z (default identity).",
     )
     p.add_argument(
@@ -1038,6 +1218,16 @@ def main() -> None:
             size=dst_box.size,
             quat_wxyz=viz_payload["dst_box_quat_used"],
         )
+        ee_targets_infer_viz = np.asarray(viz_payload.get("ee_targets_infer", np.empty((0, 3), dtype=np.float64)))
+        src_corners_selected_viz = np.asarray(viz_payload.get("src_corners_selected", np.empty((0, 3), dtype=np.float64)))
+        dst_corners_selected_viz = np.asarray(viz_payload.get("dst_corners_selected", np.empty((0, 3), dtype=np.float64)))
+        dst_box_infer_viz = None
+        if ee_targets_infer_viz.size > 0:
+            dst_box_infer_viz = BoxFrame(
+                center=np.asarray(viz_payload["dst_box_infer_center"], dtype=np.float64),
+                size=np.asarray(viz_payload["dst_box_infer_size"], dtype=np.float64),
+                quat_wxyz=np.asarray(viz_payload["dst_box_infer_quat"], dtype=np.float64),
+            )
         _visualize_before_after(
             robot_urdf=robot_urdf,
             src_box=src_box_for_viz,
@@ -1047,6 +1237,10 @@ def main() -> None:
             ee_before=viz_payload["ee_before"],
             ee_after=viz_payload["ee_after"],
             ee_targets=viz_payload["ee_targets"],
+            ee_targets_infer=ee_targets_infer_viz if ee_targets_infer_viz.size > 0 else None,
+            dst_box_infer=dst_box_infer_viz,
+            src_corners_selected=src_corners_selected_viz if src_corners_selected_viz.size > 0 else None,
+            dst_corners_selected=dst_corners_selected_viz if dst_corners_selected_viz.size > 0 else None,
         )
 
 
