@@ -1,6 +1,15 @@
 """Whole Body Tracking randomization presets for the G1 robot."""
 
-from holosoma.config_types.randomization import RandomizationManagerCfg, RandomizationTermCfg
+from holosoma.config_types.randomization import (
+    BaseComRange,
+    InertiaScale,
+    IsaacGymMaterialDR,
+    IsaacSimMaterialDR,
+    MaterialRandomizationConfig,
+    MujocoMaterialDR,
+    RandomizationManagerCfg,
+    RandomizationTermCfg,
+)
 
 robot_state_dr_at_setup = {
     "randomize_robot_rigid_body_material_startup": RandomizationTermCfg(
@@ -14,14 +23,14 @@ robot_state_dr_at_setup = {
     "randomize_base_com_startup": RandomizationTermCfg(
         func="holosoma.managers.randomization.terms.locomotion:randomize_base_com_startup",
         params={
-            "base_com_range": {"x": [-0.025, 0.025], "y": [-0.05, 0.05], "z": [-0.05, 0.05]},
+            "base_com_range": BaseComRange(x=[-0.025, 0.025], y=[-0.05, 0.05], z=[-0.05, 0.05]),
             "enabled": True,
         },
     ),
     "setup_dof_pos_bias": RandomizationTermCfg(
         func="holosoma.managers.randomization.terms.locomotion:setup_dof_pos_bias",
         params={
-            "dof_pos_bias_range": [-0.025, 0.025],
+            "dof_pos_bias_range": [-0.01, 0.01],
             "enabled": True,
         },
     ),
@@ -29,32 +38,31 @@ robot_state_dr_at_setup = {
 
 object_state_dr_at_setup = {
     "randomize_object_rigid_body_material_startup": RandomizationTermCfg(
-        func="holosoma.managers.randomization.terms.locomotion:randomize_object_rigid_body_material_startup",
+        func="holosoma.managers.randomization.terms.objects:randomize_object_rigid_body_material_startup",
         params={
-            "static_friction_range": [0.1, 0.6],
-            "dynamic_friction_range": [0.1, 0.6],
-            "restitution_range": [0.0, 1.0],
+            # Per-backend channels via the typed config — each backend names ONLY what it honors
+            # (no silent cross-backend drop). MuJoCo has no restitution channel (it's solref).
+            "material": MaterialRandomizationConfig(
+                isaacgym=IsaacGymMaterialDR(friction=[0.1, 0.6], restitution=[0.0, 1.0]),
+                isaacsim=IsaacSimMaterialDR(
+                    static_friction=[0.1, 0.6], dynamic_friction=[0.1, 0.6], restitution=[0.0, 1.0]
+                ),
+                mujoco=MujocoMaterialDR(sliding_friction=[0.1, 0.6]),
+            ),
         },
     ),
     "randomize_object_rigid_body_mass_startup": RandomizationTermCfg(
-        func="holosoma.managers.randomization.terms.locomotion:randomize_object_rigid_body_mass_startup",
+        func="holosoma.managers.randomization.terms.objects:randomize_object_rigid_body_mass_startup",
         params={
             "mass_distribution_params": [1.0, 4.0],
         },
     ),
     "randomize_object_rigid_body_inertia_startup": RandomizationTermCfg(
-        func="holosoma.managers.randomization.terms.locomotion:randomize_object_rigid_body_inertia_startup",
+        func="holosoma.managers.randomization.terms.objects:randomize_object_rigid_body_inertia_startup",
         params={
-            "inertia_distribution_params_dict": {
-                # In beyondmimic, only Ixx is randomized, which is probably a bug instead of a feature.
-                # Here, we want to reproduce their work. User should feel free to randomize all terms.
-                "Ixx": [0.5, 1.5],
-                "Iyy": [1.0, 1.0],
-                "Izz": [1.0, 1.0],
-                "Ixy": [1.0, 1.0],
-                "Iyz": [1.0, 1.0],
-                "Ixz": [1.0, 1.0],
-            }
+            # Only Ixx is randomized, reproducing beyondmimic. Unnamed components default to
+            # identity [1.0, 1.0]; name more to randomize them.
+            "inertia_distribution_params_dict": InertiaScale(Ixx=[0.5, 1.5]),
         },
     ),
 }
@@ -74,7 +82,7 @@ base_setup_terms = {
             "kp_range": [0.9, 1.1],
             "kd_range": [0.9, 1.1],
             "rfi_lim_range": [1.0, 1.0],
-            "enable_pd_gain": True,
+            "enable_pd_gain": False,
             "enable_rfi_lim": False,
         },
     ),
@@ -101,14 +109,13 @@ base_reset_terms = {
     "actuator_randomizer_state": RandomizationTermCfg(
         func="holosoma.managers.randomization.terms.locomotion:ActuatorRandomizerState"
     ),
-    # TODO: what is the difference between reset and setup? for joint_pos_bias_range?
     "randomize_dof_state": RandomizationTermCfg(
         func="holosoma.managers.randomization.terms.locomotion:randomize_dof_state",
         params={
             "joint_pos_scale_range": [1.0, 1.0],
             "joint_vel_range": [0.0, 0.0],
-            "joint_pos_bias_range": [-0.025, 0.025],
-            "randomize_dof_pos_bias": True,
+            "joint_pos_bias_range": [-0.01, 0.01],
+            "randomize_dof_pos_bias": False,
         },
     ),
 }
@@ -141,4 +148,7 @@ g1_29dof_wbt_randomization_w_object = RandomizationManagerCfg(
     },
 )
 
-__all__ = ["g1_29dof_wbt_randomization", "g1_29dof_wbt_randomization_w_object"]
+__all__ = [
+    "g1_29dof_wbt_randomization",
+    "g1_29dof_wbt_randomization_w_object",
+]

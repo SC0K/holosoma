@@ -76,8 +76,15 @@ def main() -> None:
         raise ValueError(f"qpos must be 2D (T,D), got {qpos.shape}")
 
     model = mujoco.MjModel.from_xml_path(str(Path(args.robot_xml)))
-    if qpos.shape[1] != model.nq:
-        raise ValueError(f"qpos second dim ({qpos.shape[1]}) does not match robot nq ({model.nq})")
+    if qpos.shape[1] < model.nq:
+        raise ValueError(f"qpos second dim ({qpos.shape[1]}) is smaller than robot nq ({model.nq})")
+
+    # Retargeted robot-object motions append the object's free-joint pose to the
+    # robot qpos.  This converter reconstructs robot bodies using a robot-only
+    # model, so keep the robot prefix and deliberately ignore the object tail.
+    robot_qpos = qpos[:, : model.nq]
+    if qpos.shape[1] > model.nq:
+        print(f"Ignoring {qpos.shape[1] - model.nq} trailing non-robot qpos columns")
 
     dof_names, body_names, body_ids = _collect_actuated_joint_and_body_names(model)
     dof_count = len(dof_names)
@@ -86,10 +93,10 @@ def main() -> None:
         raise ValueError("No actuated joints found in robot model.")
 
     T = qpos.shape[0]
-    qvel_all = _compute_qvel_sequence(model, qpos, fps)
+    qvel_all = _compute_qvel_sequence(model, robot_qpos, fps)
     # Free joint contributes 6 velocities; remainder maps to actuated joints.
     dof_velocities = qvel_all[:, model.nv - dof_count :].astype(np.float32)
-    dof_positions = qpos[:, model.nq - dof_count :].astype(np.float32)
+    dof_positions = robot_qpos[:, model.nq - dof_count :].astype(np.float32)
 
     body_positions = np.zeros((T, body_count, 3), dtype=np.float32)
     body_rotations = np.zeros((T, body_count, 4), dtype=np.float32)
@@ -98,7 +105,7 @@ def main() -> None:
 
     sim_data = mujoco.MjData(model)
     for t in range(T):
-        sim_data.qpos[:] = qpos[t]
+        sim_data.qpos[:] = robot_qpos[t]
         sim_data.qvel[:] = qvel_all[t]
         mujoco.mj_forward(model, sim_data)
         for i, bid in enumerate(body_ids):

@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Exit on error, and print commands
 set -ex
 
@@ -5,6 +6,13 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname "$SCRIPT_DIR")
 
 echo "Setting up inference environment"
+
+if ! command -v sudo &> /dev/null; then
+  # in docker build sudo isn't avaiable, but its ok
+  echo "Warning: sudo could not be found, you may need to run this script with sudo"
+  function sudo { "$@"; }
+  export -f sudo
+fi
 
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -30,18 +38,20 @@ case $OS in
 esac
 
 # Create overall workspace
-source ${SCRIPT_DIR}/source_common.sh
-ENV_ROOT=$CONDA_ROOT/envs/hsinference
+# Use CONDA_ENV_NAME if provided, otherwise default to "hsinference"
+CONDA_ENV_NAME=${CONDA_ENV_NAME:-hsinference}
+echo "conda environment name is set to: $CONDA_ENV_NAME"
 
-SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_inference
+source ${SCRIPT_DIR}/source_common.sh
+ENV_ROOT=$CONDA_ROOT/envs/$CONDA_ENV_NAME
+
+SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_$CONDA_ENV_NAME
 
 mkdir -p $WORKSPACE_DIR
 
 if [[ ! -f $SENTINEL_FILE ]]; then
   # Install swig based on OS
-  if [[ $OS == "Linux" ]]; then
-    $INSTALL_CMD swig
-  elif [[ $OS == "Darwin" ]]; then
+  if [[ $OS == "Darwin" ]]; then
     # Install brew if needed
     if ! command -v brew &> /dev/null; then
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -49,8 +59,8 @@ if [[ ! -f $SENTINEL_FILE ]]; then
       echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> $HOME/.zprofile
       eval "$(/opt/homebrew/bin/brew shellenv)"
     fi
-    $INSTALL_CMD swig
   fi
+  $INSTALL_CMD swig
 
   # Install miniconda
   if [[ ! -d $CONDA_ROOT ]]; then
@@ -65,17 +75,25 @@ if [[ ! -f $SENTINEL_FILE ]]; then
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
     $CONDA_ROOT/bin/conda install -y mamba -c conda-forge -n base
-    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n hsinference python=3.10 -c conda-forge --override-channels
+    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n $CONDA_ENV_NAME python=3.10 -c conda-forge --override-channels
   fi
 
-  source $CONDA_ROOT/bin/activate hsinference
+  source $CONDA_ROOT/bin/activate $CONDA_ENV_NAME
 
   # Install libstdcxx-ng to fix the error: `version `GLIBCXX_3.4.32' not found` on Ubuntu 24.04
-  conda install -c conda-forge -y libstdcxx-ng
+  # Only needed on Linux (not macOS)
+  if [[ $OS == "Linux" ]]; then
+    conda install -c conda-forge -y libstdcxx-ng
+  fi
 
   # Install holosoma_inference
-  pip install -e $ROOT_DIR/src/holosoma_inference[unitree,booster]
-
+  # Note: On macOS, only Unitree SDK is supported (Booster SDK is Linux-only)
+  if [[ $OS == "Darwin" ]]; then
+    echo "Note: Installing Unitree SDK only (Booster SDK is not supported on macOS)"
+    pip install -e $ROOT_DIR/src/holosoma_inference[unitree]
+  else
+    pip install -e $ROOT_DIR/src/holosoma_inference[unitree,booster]
+  fi
   # Setup a few things for ARM64 Linux (G1 Jetson)
   # Otherwise we get this error:
   # /opt/rh/gcc-toolset-14/root/usr/include/c++/14/bits/stl_vector.h:1130: ...

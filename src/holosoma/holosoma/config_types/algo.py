@@ -180,6 +180,9 @@ class PPOConfig:
     init_at_random_ep_len: bool = True
     """Whether to initialize at random episode length."""
 
+    empirical_normalization: bool = False
+    """Whether to apply empirical normalization to actor and critic observations."""
+
     eval_callbacks: Any = None
     """Evaluation callbacks configuration."""
 
@@ -304,6 +307,9 @@ class FastSACConfig:
 
     actor_obs_keys: List[str] = field(default_factory=lambda: ["actor_obs"])
     critic_obs_keys: List[str] = field(default_factory=lambda: ["critic_obs"])
+
+    eval_callbacks: Any = None
+    """Evaluation callbacks configuration."""
 
 
 @dataclass(frozen=True)

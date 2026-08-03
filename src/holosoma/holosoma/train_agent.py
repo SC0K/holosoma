@@ -9,12 +9,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
-import tyro
 from loguru import logger
 
 from holosoma.config_types.env import get_tyro_env_config
 from holosoma.config_types.experiment import ExperimentConfig
-from holosoma.config_values.experiment import AnnotatedExperimentConfig
 from holosoma.utils.config_utils import CONFIG_NAME
 from holosoma.utils.eval_utils import (
     init_sim_imports,
@@ -22,7 +20,6 @@ from holosoma.utils.eval_utils import (
 )
 from holosoma.utils.helpers import get_class
 from holosoma.utils.sim_utils import close_simulation_app
-from holosoma.utils.tyro_utils import TYRO_CONIFG
 
 
 class TrainingContext:
@@ -78,7 +75,16 @@ def configure_multi_gpu() -> MultGPUConfig | None:
     if gpu_global_rank >= gpu_world_size:
         raise ValueError(f"Global rank '{gpu_global_rank}' is greater than or equal to world size '{gpu_world_size}'.")
 
-    torch.distributed.init_process_group(backend="nccl", rank=gpu_global_rank, world_size=gpu_world_size)
+    dist_backend = os.getenv("TORCH_DIST_BACKEND", "nccl")
+    dist_timeout_s = int(os.getenv("TORCH_DIST_INIT_TIMEOUT_S", "7200"))
+    from datetime import timedelta
+
+    torch.distributed.init_process_group(
+        backend=dist_backend,
+        rank=gpu_global_rank,
+        world_size=gpu_world_size,
+        timeout=timedelta(seconds=dist_timeout_s),
+    )
     torch.cuda.set_device(gpu_local_rank)
 
     multi_gpu_config: MultGPUConfig = {
@@ -154,6 +160,7 @@ def train(tyro_config: ExperimentConfig, training_context: TrainingContext | Non
         simulation_app = init_sim_imports(tyro_config)
         auto_close = True
 
+    env = None
     try:
         # have to import torch after isaacgym
         import torch  # noqa: F401
@@ -170,7 +177,7 @@ def train(tyro_config: ExperimentConfig, training_context: TrainingContext | Non
         distributed_conf: MultGPUConfig | None = configure_multi_gpu()
         device: str = get_device(tyro_config, distributed_conf)
         is_distributed = distributed_conf is not None
-        is_main_process = distributed_conf is None or distributed_conf["local_rank"] == 0
+        is_main_process = distributed_conf is None or distributed_conf["global_rank"] == 0
 
         # Configure logger
         logger_cfg = tyro_config.logger
@@ -219,8 +226,9 @@ def train(tyro_config: ExperimentConfig, training_context: TrainingContext | Non
                 "dir": str(wandb_dir),
                 "mode": wandb_cfg.mode,
             }
-            if wandb_cfg.entity:
-                wandb_kwargs["entity"] = wandb_cfg.entity
+            wandb_entity = os.getenv("WANDB_ENTITY") or wandb_cfg.entity
+            if wandb_entity:
+                wandb_kwargs["entity"] = wandb_entity
             if wandb_cfg.group:
                 wandb_kwargs["group"] = wandb_cfg.group
             if wandb_cfg.id:
@@ -304,6 +312,16 @@ def train(tyro_config: ExperimentConfig, training_context: TrainingContext | Non
         logger.error(f"Exception occurred during training: {e}\n{tb_str}")
         sys.exit(1)  # manually set exit code, not possible via isaacsim app.close()
     finally:
+        # Fire the simulator CLOSE phase (bridge/video teardown). Prefer env.close() if the env
+        # wrapper defines one; else reach the simulator directly.
+        if env is not None:
+            try:
+                if hasattr(env, "close"):
+                    env.close()
+                elif hasattr(env, "simulator") and hasattr(env.simulator, "close"):
+                    env.simulator.close()
+            except Exception as e:
+                logger.warning(f"Environment close failed: {e}")
         if auto_close:
             close_simulation_app(simulation_app)
 
@@ -311,8 +329,11 @@ def train(tyro_config: ExperimentConfig, training_context: TrainingContext | Non
 
 
 def main() -> None:
-    tyro_cfg = tyro.cli(AnnotatedExperimentConfig, config=TYRO_CONIFG)
-    print(tyro_cfg.curriculum)
+    from holosoma.config_values.experiment import get_annotated_experiment_config
+    from holosoma.utils.config_registry import parse_config
+
+    # Pass the factory uncalled so parse_config builds it after plugins load.
+    tyro_cfg = parse_config(get_annotated_experiment_config)
     train(tyro_cfg)
 
 

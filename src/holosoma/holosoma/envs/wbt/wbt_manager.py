@@ -13,6 +13,7 @@ from holosoma.utils.simulator_config import SimulatorType
 class WholeBodyTrackingManager(BaseTask):
     def __init__(self, tyro_config, *, device):
         super().__init__(tyro_config, device=device)
+        assert not hasattr(self.simulator, "gym"), "WBT requires IsaacSim — IsaacGym is not supported."
 
     def _init_buffers(self):
         """Initialize torch tensors which will contain simulation states and processed quantities"""
@@ -121,7 +122,8 @@ class WholeBodyTrackingManager(BaseTask):
         rand = torch.rand(len(env_ids), 6, device=self.device) * 2 - 1
         self.push_robot_vel_buf[env_ids] = rand * max_vel_tensor.unsqueeze(0)
         self.record_push_robot_vel_buf[env_ids] = self.push_robot_vel_buf[env_ids].clone()
-        self.simulator.robot_root_states[env_ids, 7:13] = self.push_robot_vel_buf[env_ids]
+        # Additive push to match BeyondMimic/IsaacLab's push_by_setting_velocity.
+        self.simulator.robot_root_states[env_ids, 7:13] += self.push_robot_vel_buf[env_ids]
         # Push impulses only take effect in the simulator once we write the mutated root state tensor back.
         self.simulator.set_actor_root_state_tensor_robots(env_ids, self.simulator.robot_root_states)
         self._max_push_vel = max_vel_tensor.clone()
@@ -230,7 +232,8 @@ class WholeBodyTrackingManager(BaseTask):
             object_states[:, 3:7] = object_ori[:]
             object_states[:, 7:10] = object_lin_vel[:]
             object_states[:, 10:13] = torch.zeros_like(object_lin_vel[:])
-            self.simulator.set_actor_states(["object"], env_ids, object_states)
+            object_name = motion_command.object_name
+            self.simulator.set_actor_states([object_name], env_ids, object_states)
 
         self.simulator.scene.write_data_to_sim()
         self.simulator.sim.forward()

@@ -19,6 +19,10 @@ python examples/robot_retarget.py --data_path demo_data/climb --task-type climbi
 
 **Note**: Add `--augmentation` to run sequences with augmentation. You must first run the original sequence before adding augmentation.
 
+For a single object-interaction sequence, `--augmentation` scales the box by
+`--task-config.object-scale` (default: `1.0 1.0 1.2`). To use a replacement box
+OBJ instead, pass `--task-config.augmentation-object-mesh /path/to/box.obj`.
+
 ## Batch Processing for Motion Retargeting
 
 ```bash
@@ -32,7 +36,71 @@ python examples/parallel_robot_retarget.py --data-dir demo_data/OMOMO_new --task
 python examples/parallel_robot_retarget.py --data-dir demo_data/climb --task-type climbing --data_format mocap --robot-config.robot-urdf-file models/g1/g1_29dof_spherehand.urdf --task-config.object-name multi_boxes --save_dir demo_results_parallel/g1/climbing/mocap_climb
 ```
 
-**Note**: Add `--augmentation` to run original sequences and sequences with augmentation (for object interaction and climbing tasks).
+**Note**: Add `--augmentation` to run original sequences and sequences with augmentation (for object interaction and climbing tasks). Object-interaction augmentation includes translation, yaw, and the box scales configured by `--task-config.object-scale-variants`.
+
+To generate only box-size augmentations (plus the original), use:
+
+```bash
+python examples/parallel_robot_retarget.py \
+    --data-dir demo_data/OMOMO_new \
+    --task-type object_interaction \
+    --augmentation \
+    --task-config.object-name largebox \
+    --task-config.object-augmentation-mode scale \
+    --task-config.object-scale-variants 0.8 0.8 0.8 1.2 1.2 1.2
+```
+
+To retarget against one or more replacement box OBJ meshes, pass paths with
+`--task-config.object-mesh-variants`. The meshes must use the same local axes as
+the source box; vertex count and triangulation may differ. For example:
+
+```bash
+python examples/parallel_robot_retarget.py \
+    --data-dir demo_data/OMOMO_new \
+    --task-type object_interaction \
+    --augmentation \
+    --task-config.object-name largebox \
+    --task-config.object-mesh-variants models/box_small/box_small.obj models/box_large/box_large.obj
+```
+
+Generated object URDFs and MuJoCo collision scenes are stored under
+`<save-dir>/_generated_objects/<task-name>/`. Use the matching generated URDF
+when visualizing a `mesh_*` or `scale_*` result.
+
+### Direct G1-to-G1 Box-Size Augmentation
+
+An existing retargeted G1 object-interaction trajectory can be re-optimized for
+a different box size without loading the original human/SMPL motion:
+
+```bash
+python examples/g1_box_augment.py \
+    --input-npz demo_results_parallel/g1/object_interaction/omomo/sub10_largebox_049_original.npz \
+    --scale 1.2 1.2 1.2
+```
+
+The input must contain the G1 configuration and object pose in `qpos`. Native
+HoloSoma files and OmniRetarget files use different root/object field orders;
+the command detects either layout automatically. For a known OmniRetarget input,
+pass `--input-layout omniretarget` explicitly. Corrected outputs are always saved
+in native HoloSoma/MuJoCo order and include `qpos_layout=native` metadata. The
+command detects robot-foot sticking from G1 FK,
+constructs the source interaction mesh from G1 link positions, keeps the source
+trajectory as the nominal motion, and writes a matching generated object URDF.
+Use `--output /path/to/result.npz` to select the output path. `--max-frames N`
+can be used for a quick prefix test before processing the complete trajectory.
+
+To visualize an original OmniRetarget file directly:
+
+```bash
+python viser_player.py \
+    --qpos-npz /path/to/OmniRetarget_Dataset/robot-object/motion.npz \
+    --input-layout omniretarget \
+    --robot-urdf models/g1/g1_29dof.urdf \
+    --object-urdf models/largebox/largebox.urdf
+```
+
+For newly augmented files, leave `--input-layout auto` (the default) and use
+the generated object URDF printed by the augmentation command.
 
 ## Data Preparation
 
@@ -132,6 +200,23 @@ python examples/parallel_robot_retarget.py --data-dir demo_data/amass_smplx_proc
 ```
 
 ## Check Visualizations of Saved Retargeting Results
+
+### Align a Replacement Box Mesh
+
+Use the interactive alignment UI to determine the orientation offset between a
+replacement mesh and the original object frame:
+
+```bash
+python examples/align_box_meshes.py \
+    --target-mesh /path/to/new_box.obj \
+    --output box_orientation_offset.json
+```
+
+Open `http://localhost:8080`, then adjust the target mesh with the roll, pitch,
+yaw, and translation sliders. The original mesh is shown as a blue wireframe
+and the target mesh is orange. Click **Save offset JSON** to save the rotation
+matrix, WXYZ quaternion, Euler angles, and translation. The saved transform uses
+`p_original = R_offset @ p_target + translation`.
 
 ```bash
 # Visualize object-interaction results

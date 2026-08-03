@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import dataclasses
@@ -6,23 +7,67 @@ import os
 import subprocess
 import sys
 from datetime import timezone
+from os import getenv
 from pathlib import Path
 
-import tyro
-
-from holosoma.config_values.experiment import AnnotatedExperimentConfig
+from holosoma.config_types.experiment import ExperimentConfig
+from holosoma.config_values.experiment import get_annotated_experiment_config
 from holosoma.train_agent import training_context
-from holosoma.utils.tyro_utils import TYRO_CONIFG
+from holosoma.utils.config_registry import parse_config
 
 REPO_ROOT = Path(__file__).parent.parent.parent.absolute()
+
+# Github assigned variables
+GITHUB_SERVER_URL = getenv("GITHUB_SERVER_URL")
+GITHUB_REPOSITORY = getenv("GITHUB_REPOSITORY")
+GITHUB_RUN_ID = getenv("GITHUB_RUN_ID")
+
+# Number of GPUs used for a multi-GPU nightly run (matches torchrun --nproc_per_node
+# below and the x4 GPU runner in .github/workflows/nightly-training.yaml).
+MULTIGPU_NUM_GPUS = 4
 
 
 def now_timestamp() -> str:
     return datetime.datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def validate_wandb_metrics(config: ExperimentConfig):
+    # lazy import to avoid conflicts with Isaac
+    import wandb
+
+    assert wandb.run is not None, "wandb run failed! wandb.run is `None`"
+    api = wandb.Api()
+    run = api.run(f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}")
+    df_hist = run.history()
+
+    failures: list[str] = []
+    assert config.nightly is not None  # for type checking
+    assert config.nightly.metrics is not None
+
+    for k, v in config.nightly.metrics.items():
+        v_min = float(v[0])
+        v_max = float(v[1])
+        v_last_100 = df_hist[k][-100:].mean()
+
+        is_in_range = v_min <= v_last_100 <= v_max
+        if not is_in_range:
+            msg = f"Metric {k}={v_last_100:0.2f} is not in range ({v_min}, {v_max})"
+            print(msg)
+            failures.append(msg)
+
+    # 3. Any other post-training work can go here
+    if len(failures) > 0:
+        print(f"Some tests failed! Metrics outside of expected ranges: {failures}")
+        run.tags += ("nightly_test_failed",)
+        run.update()
+    else:
+        run.tags += ("nightly_test_passed",)
+        run.update()
+
+
 def main():
-    config = tyro.cli(AnnotatedExperimentConfig, config=TYRO_CONIFG)
+    original_args = sys.argv[1:]
+    config = parse_config(get_annotated_experiment_config)
 
     # Check if multigpu is requested and we're not already in a torchrun process
     if config.training.multigpu and "RANK" not in os.environ:
@@ -32,9 +77,9 @@ def main():
         result = subprocess.run(
             [
                 "torchrun",
-                "--nproc_per_node=4",
+                f"--nproc_per_node={MULTIGPU_NUM_GPUS}",
                 __file__,
-                *sys.argv[1:],  # Pass all original arguments
+                *original_args,  # Pass all original arguments
             ],
             env=env,
             check=False,
@@ -55,12 +100,31 @@ def main():
 
     config = config.get_nightly_config()
 
+    run_tags = [
+        sanitized_exp,
+        config.simulator.config.name,
+    ]
+
+    if GITHUB_RUN_ID:
+        run_tags.append(f"gha-run-id-{GITHUB_RUN_ID}")
+
+    if config.training.multigpu:
+        run_tags.append("multigpu")
+        run_tags.append(f"gpus-{MULTIGPU_NUM_GPUS}")
+    else:
+        run_tags.append("singlegpu")
+        run_tags.append("gpus-1")
+
+    nightly_name = f"nightly-{sanitized_exp}{multigpu_suffix}-{now_timestamp()}"
+
     config = dataclasses.replace(
         config,
         logger=dataclasses.replace(
             config.logger,
-            project=f"nightly-{sanitized_exp}{multigpu_suffix}",
-            name=f"nightly-{sanitized_exp}{multigpu_suffix}-{now_timestamp()}",
+            project="nightly-holosoma-runs",
+            name=nightly_name,
+            id=nightly_name,  # set id to name so url is readable
+            tags=tuple(run_tags),
         ),
     )
 
@@ -70,34 +134,7 @@ def main():
 
         # 2. Validate metrics (explicit, linear flow) - only on rank 0
         if os.environ.get("RANK", "0") == "0":
-            # lazy import to avoid conflicts with Isaac
-            import wandb
-
-            assert wandb.run is not None, "wandb run failed! wandb.run is `None`"
-            api = wandb.Api()
-            run = api.run(f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}")
-            df_hist = run.history()
-
-            failures: list[str] = []
-            for k, v in config.nightly.metrics.items():
-                v_min = float(v[0])
-                v_max = float(v[1])
-                v_last_100 = df_hist[k][-100:].mean()
-
-                is_in_range = v_min <= v_last_100 <= v_max
-                if not is_in_range:
-                    msg = f"Metric {k}={v_last_100:0.2f} is not in range ({v_min}, {v_max})"
-                    print(msg)
-                    failures.append(msg)
-
-            # 3. Any other post-training work can go here
-            if len(failures) > 0:
-                print(f"Some tests failed! Metrics outside of expected ranges: {failures}")
-                run.tags += ("nightly_test_failed",)
-                run.update()
-            else:
-                run.tags += ("nightly_test_passed",)
-                run.update()
+            validate_wandb_metrics(config)
 
     # 4. simulation_app automatically closed when exiting context
 

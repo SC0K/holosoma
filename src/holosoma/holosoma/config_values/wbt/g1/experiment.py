@@ -10,6 +10,7 @@ from holosoma.config_values import (
     randomization,
     reward,
     robot,
+    scene,
     simulator,
     termination,
     terrain,
@@ -19,18 +20,22 @@ g1_29dof_wbt = ExperimentConfig(
     training=TrainingConfig(
         project="WholeBodyTracking",
         name="g1_29dof_wbt_manager",
-        num_envs=8192,
+        num_envs=4096,
     ),
     env_class="holosoma.envs.wbt.wbt_manager.WholeBodyTrackingManager",
     algo=replace(
         algo.ppo,
         config=replace(
             algo.ppo.config,
-            num_learning_iterations=40000,
+            num_learning_iterations=30000,
+            num_learning_epochs=5,
             save_interval=4000,
             entropy_coef=0.005,
             init_noise_std=1.0,
-            init_at_random_ep_len=False,
+            actor_learning_rate=1e-3,
+            critic_learning_rate=1e-3,
+            init_at_random_ep_len=True,
+            empirical_normalization=True,
             use_symmetry=False,
             actor_optimizer=replace(algo.ppo.config.actor_optimizer, weight_decay=0.000),
             critic_optimizer=replace(algo.ppo.config.critic_optimizer, weight_decay=0.000),
@@ -48,7 +53,11 @@ g1_29dof_wbt = ExperimentConfig(
     ),
     robot=replace(
         robot.g1_29dof,
-        control=replace(robot.g1_29dof.control, action_scale=1.0),
+        control=replace(
+            robot.g1_29dof.control,
+            action_scale=0.25,
+            action_scales_by_effort_limit_over_p_gain=True,
+        ),
         asset=replace(robot.g1_29dof.asset, enable_self_collisions=True),
         init_state=replace(robot.g1_29dof.init_state, pos=[0.0, 0.0, 0.76]),
     ),
@@ -63,12 +72,12 @@ g1_29dof_wbt = ExperimentConfig(
     nightly=NightlyConfig(
         iterations=8000,
         metrics={
-            "Episode/rew_motion_global_ref_position_error_exp": [0.16, "inf"],
-            "Episode/rew_motion_global_ref_orientation_error_exp": [0.25, "inf"],
-            "Episode/rew_motion_relative_body_position_error_exp": [0.45, "inf"],
-            "Episode/rew_motion_relative_body_orientation_error_exp": [0.30, "inf"],
-            "Episode/rew_motion_global_body_lin_vel": [0.30, "inf"],
-            "Episode/rew_motion_global_body_ang_vel": [0.02, "inf"],
+            "Episode/rew_motion_global_ref_position_error_exp": [0.3, "inf"],
+            "Episode/rew_motion_global_ref_orientation_error_exp": [0.4, "inf"],
+            "Episode/rew_motion_relative_body_position_error_exp": [0.85, "inf"],
+            "Episode/rew_motion_relative_body_orientation_error_exp": [0.7, "inf"],
+            "Episode/rew_motion_global_body_lin_vel": [0.60, "inf"],
+            "Episode/rew_motion_global_body_ang_vel": [0.45, "inf"],
         },
     ),
 )
@@ -77,7 +86,7 @@ g1_29dof_wbt_fast_sac = ExperimentConfig(
     training=TrainingConfig(
         project="WholeBodyTracking",
         name="g1_29dof_wbt_fast_sac_manager",
-        num_envs=8192,
+        num_envs=4096,
     ),
     env_class="holosoma.envs.wbt.wbt_manager.WholeBodyTrackingManager",
     algo=replace(
@@ -109,7 +118,11 @@ g1_29dof_wbt_fast_sac = ExperimentConfig(
     ),
     robot=replace(
         robot.g1_29dof,
-        control=replace(robot.g1_29dof.control, action_scale=1.0),
+        control=replace(
+            robot.g1_29dof.control,
+            action_scale=0.25,
+            action_scales_by_effort_limit_over_p_gain=True,
+        ),
         asset=replace(robot.g1_29dof.asset, enable_self_collisions=True),
         init_state=replace(robot.g1_29dof.init_state, pos=[0.0, 0.0, 0.76]),
     ),
@@ -143,19 +156,12 @@ g1_29dof_wbt_w_object = replace(
             robot.g1_29dof_w_object.asset,
             enable_self_collisions=True,
         ),
-        object=replace(
-            robot.g1_29dof_w_object.object,
-            object_urdf_path="holosoma/data/motions/g1_29dof/whole_body_tracking/objects_largebox.urdf",
-        ),
         init_state=replace(robot.g1_29dof_w_object.init_state, pos=[0.0, 0.0, 0.76]),
     ),
     randomization=randomization.g1_29dof_wbt_randomization_w_object,
     observation=observation.g1_29dof_wbt_observation_w_object,
     reward=reward.g1_29dof_wbt_reward_w_object,
-    simulator=replace(
-        simulator.isaacsim,
-        config=replace(simulator.isaacsim.config, scene=replace(simulator.isaacsim.config.scene, env_spacing=0.0)),
-    ),
+    scene=scene.g1_29dof_wbt_object_scene,
 )
 
 g1_29dof_wbt_fast_sac_w_object = replace(
@@ -164,19 +170,12 @@ g1_29dof_wbt_fast_sac_w_object = replace(
     robot=replace(
         robot.g1_29dof_w_object,
         asset=replace(robot.g1_29dof_w_object.asset, enable_self_collisions=True),
-        object=replace(
-            robot.g1_29dof_w_object.object,
-            object_urdf_path="holosoma/data/motions/g1_29dof/whole_body_tracking/objects_largebox.urdf",
-        ),
         init_state=replace(robot.g1_29dof_w_object.init_state, pos=[0.0, 0.0, 0.76]),
     ),
     randomization=randomization.g1_29dof_wbt_randomization_w_object,
     observation=observation.g1_29dof_wbt_observation_w_object,
     reward=reward.g1_29dof_wbt_reward_w_object,
-    simulator=replace(
-        simulator.isaacsim,
-        config=replace(simulator.isaacsim.config, scene=replace(simulator.isaacsim.config.scene, env_spacing=0.0)),
-    ),
+    scene=scene.g1_29dof_wbt_object_scene,
 )
 
 __all__ = [
@@ -202,5 +201,5 @@ python src/holosoma/holosoma/train_agent.py \
   --terrain.terrain-term.obj-file-path="holosoma/data/motions/g1_29dof/whole_body_tracking/terrain_slope.obj" \
   --command.setup_terms.motion_command.params.motion_config.motion_file\
 ="holosoma/data/motions/g1_29dof/whole_body_tracking/motion_crawl_slope.npz" \
-  --simulator.config.scene.env_spacing=0.0
+  --scene.env_spacing=0.0
 """

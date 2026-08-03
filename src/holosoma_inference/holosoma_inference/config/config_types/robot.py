@@ -56,22 +56,6 @@ class RobotConfig:
     """
 
     # =========================================================================
-    # Limits (REQUIRED - no defaults)
-    # =========================================================================
-
-    joint_pos_min: tuple[float, ...]
-    """Lower position limits for joints in radians (length: num_joints)."""
-
-    joint_pos_max: tuple[float, ...]
-    """Upper position limits for joints in radians (length: num_joints)."""
-
-    joint_vel_limit: tuple[float, ...]
-    """Velocity limits for joints in rad/s (length: num_joints)."""
-
-    motor_effort_limit: tuple[float, ...]
-    """Torque/effort limits for motors in Nm (length: num_motors)."""
-
-    # =========================================================================
     # Mappings (REQUIRED - no defaults)
     # =========================================================================
 
@@ -133,6 +117,9 @@ class RobotConfig:
     If provided, these values override the ONNX metadata.
     """
 
+    default_per_joint_action_scale: tuple[float, ...] | None = None
+    """Fallback per-joint action scales used when ONNX metadata is missing."""
+
     # =========================================================================
     # WBT Stiff Startup Configuration (OPTIONAL - for WBT policies)
     # =========================================================================
@@ -162,8 +149,12 @@ class RobotConfig:
     # SDK Configuration (OPTIONAL - with defaults)
     # =========================================================================
 
-    sdk_type: typing.Literal["unitree", "booster", "ros2"] = "unitree"
-    """SDK type for robot communication."""
+    sdk_type: str = "unitree"
+    """SDK type for robot communication.
+
+    Built-in types: 'unitree', 'booster'.
+    Extensions can register additional SDK types.
+    """
 
     motor_type: typing.Literal["serial", "parallel"] = "serial"
     """Motor communication type."""
@@ -231,3 +222,15 @@ class RobotConfig:
 
     num_upper_body_joints: int = 14
     """Number of upper body degrees of freedom."""
+
+    # =========================================================================
+    # Per-Robot Calibration
+    # =========================================================================
+
+    joint_offsets_deg: tuple[float, ...] | None = None
+    """Per-joint offsets in degrees applied to lowcmd (action-space only).
+
+    These offsets correct for per-robot motor calibration differences without
+    affecting the observation/state space. Converted to radians at init time.
+    Length must equal num_joints when provided.
+    """

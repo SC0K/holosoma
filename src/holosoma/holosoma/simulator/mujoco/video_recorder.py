@@ -11,9 +11,10 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
+import mujoco
 from loguru import logger
 
-import mujoco
+from holosoma.simulator.mujoco.backends.base import apply_sensor_scene_flags
 from holosoma.simulator.shared.video_recorder import VideoRecorderInterface
 
 if TYPE_CHECKING:
@@ -41,9 +42,12 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
         # Override typing for mypy
         self.simulator: MuJoCo = simulator
 
-        # Thread-local renderer storage (created lazily via properties)
+        # Renderer/camera are created lazily via properties (the Renderer holds a GL context that is
+        # thread-affine, so it must be built on the recording thread).
         self._renderer: mujoco.Renderer | None = None
         self._camera: mujoco.MjvCamera | None = None
+
+        self.scene_option = apply_sensor_scene_flags(simulator.debug_viz_enabled)
 
         logger.info(
             f"MuJoCo video recorder initialized - {'threaded' if config.use_recording_thread else 'synchronous'} mode"
@@ -104,22 +108,6 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
                 f"extent: {extent:.2f}m)"
             )
 
-    def _resolve_tracking_body(self) -> None:
-        """MuJoCo-specific tracking body resolution.
-
-        Calls the shared resolution logic and then sets robot_model for renderer.
-
-        Raises
-        ------
-        ValueError
-            If no suitable tracking body is found.
-        """
-        # Call shared resolution logic
-        super()._resolve_tracking_body()
-
-        # Set robot_model for MuJoCo renderer compatibility
-        self.robot_model = self.simulator.root_model
-
     def _capture_frame_impl(self) -> None:
         """Unified frame capture implementation - works on any thread.
 
@@ -139,7 +127,7 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
         self._update_camera_position(self.camera)
 
         # Render frame using thread-appropriate renderer
-        self.renderer.update_scene(render_data, camera=self.camera)
+        self.renderer.update_scene(render_data, camera=self.camera, scene_option=self.scene_option)
         frame = self.renderer.render()
 
         if frame is None:
@@ -162,20 +150,14 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
     ) -> None:
         """Update camera position based on camera mode and configuration."""
 
-        # Use shared camera calculation method
-        camera_params = self._calculate_camera_parameters(robot_pos)
-
-        # Extract parameters from shared calculation
-        target = camera_params["target"]
-        distance = camera_params["distance"]
-        azimuth = camera_params["azimuth"]
-        elevation = camera_params["elevation"]
+        # Use camera controller via shared helper method
+        camera_params = self._get_camera_parameters(robot_pos)
 
         # Apply to MuJoCo camera using spherical coordinates
-        camera.lookat[:] = target
-        camera.distance = distance
-        camera.azimuth = azimuth
-        camera.elevation = -elevation
+        camera.lookat[:] = camera_params.target
+        camera.distance = camera_params.distance
+        camera.azimuth = camera_params.azimuth
+        camera.elevation = -camera_params.elevation
 
     def cleanup(self) -> None:
         """Clean up video recording resources.
@@ -188,4 +170,3 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
         # Clean up MuJoCo resources
         self._renderer = None
         self._camera = None
-        self.robot_body_id = None

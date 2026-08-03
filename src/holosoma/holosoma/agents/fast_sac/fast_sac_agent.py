@@ -11,6 +11,7 @@ import tqdm
 from loguru import logger
 
 from holosoma.agents.base_algo.base_algo import BaseAlgo
+from holosoma.agents.callbacks.base_callback import RLEvalCallback
 from holosoma.agents.fast_sac.fast_sac import Actor, CNNActor, CNNCritic, Critic
 from holosoma.agents.fast_sac.fast_sac_utils import (
     EmpiricalNormalization,
@@ -22,6 +23,7 @@ from holosoma.agents.modules.logging_utils import LoggingHelper
 from holosoma.config_types.algo import FastSACConfig
 from holosoma.envs.base_task.base_task import BaseTask
 from holosoma.utils.average_meters import TensorAverageMeterDict
+from holosoma.utils.helpers import instantiate
 from holosoma.utils.inference_helpers import (
     attach_onnx_metadata,
     export_motion_and_policy_as_onnx,
@@ -177,6 +179,7 @@ class FastSACAgent(BaseAlgo):
         )
 
         self.training_metrics = TensorAverageMeterDict()
+        self.eval_callbacks: list[RLEvalCallback] = []
 
     def setup(self) -> None:
         logger.info("Setting up FastSAC")
@@ -972,6 +975,11 @@ class FastSACAgent(BaseAlgo):
         # Extract control gains and velocity limits & attach to onnx as metadata
         kp_list, kd_list = get_control_gains_from_config(self.env.robot_config)
         cmd_ranges = get_command_ranges_from_env(self.unwrapped_env)
+        action_scales = getattr(self.unwrapped_env, "action_scales", None)
+        if action_scales is None:
+            action_scale_metadata: float | list[float] = float(self.env.robot_config.control.action_scale)
+        else:
+            action_scale_metadata = action_scales.detach().cpu().tolist()
         # Extract URDF text from the robot config
         urdf_file_path, urdf_str = get_urdf_text_from_robot_config(self.env.robot_config)
 
@@ -979,6 +987,7 @@ class FastSACAgent(BaseAlgo):
             "dof_names": self.env.robot_config.dof_names,
             "kp": kp_list,
             "kd": kd_list,
+            "action_scale": action_scale_metadata,
             "command_ranges": cmd_ranges,
             "robot_urdf": urdf_str,
             "robot_urdf_path": urdf_file_path,
@@ -1000,13 +1009,48 @@ class FastSACAgent(BaseAlgo):
 
     @torch.no_grad()
     def evaluate_policy(self, max_eval_steps: int | None = None):
+        self._create_eval_callbacks()
+        self._pre_evaluate_policy()
+
         obs = self.env.reset()
 
-        for _ in itertools.islice(itertools.count(), max_eval_steps):
+        for step in itertools.islice(itertools.count(), max_eval_steps):
             if self.obs_normalization:
                 normalized_obs = self.obs_normalizer(obs, update=False)
             else:
                 normalized_obs = obs
             # Actions are already scaled by the actor
             actions = self.actor(normalized_obs)[0]
-            obs, _, _, _ = self.env.step(actions)
+
+            actor_state = {"step": step, "actions": actions, "obs": obs}
+            actor_state = self._pre_eval_env_step(actor_state)
+
+            obs, _, _, _ = self.env.step(actor_state["actions"])
+            actor_state["obs"] = obs
+            actor_state = self._post_eval_env_step(actor_state)
+
+        self._post_evaluate_policy()
+
+    def _create_eval_callbacks(self):
+        if self.config.eval_callbacks is not None:
+            for cb_name in self.config.eval_callbacks:
+                self.eval_callbacks.append(instantiate(self.config.eval_callbacks[cb_name], training_loop=self))
+
+    def _pre_evaluate_policy(self):
+        self.env.set_is_evaluating()
+        for c in self.eval_callbacks:
+            c.on_pre_evaluate_policy()
+
+    def _post_evaluate_policy(self):
+        for c in self.eval_callbacks:
+            c.on_post_evaluate_policy()
+
+    def _pre_eval_env_step(self, actor_state: dict) -> dict:
+        for c in self.eval_callbacks:
+            actor_state = c.on_pre_eval_env_step(actor_state)
+        return actor_state
+
+    def _post_eval_env_step(self, actor_state: dict) -> dict:
+        for c in self.eval_callbacks:
+            actor_state = c.on_post_eval_env_step(actor_state)
+        return actor_state

@@ -3,7 +3,6 @@ from __future__ import annotations
 import itertools
 import json
 import sys
-import threading
 import time
 from collections import deque
 from dataclasses import replace
@@ -14,16 +13,23 @@ import numpy as np
 import onnx
 import onnxruntime
 from loguru import logger
-from sshkeyboard import listen_keyboard
 from termcolor import colored
 
 from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.config.config_types.robot import RobotConfig
-from holosoma_inference.sdk.interface_wrapper import InterfaceWrapper
+from holosoma_inference.inputs import create_input
+from holosoma_inference.inputs.api.base import StateCommandProvider, VelCmdProvider
+from holosoma_inference.inputs.api.commands import StateCommand, VelCmd
+from holosoma_inference.sdk import create_interface
 from holosoma_inference.utils.latency import LatencyTracker
 from holosoma_inference.utils.math.quat import quat_rotate_inverse
 from holosoma_inference.utils.rate import RateLimiter
 from holosoma_inference.utils.wandb import load_checkpoint
+
+# Maps SWITCH_POLICY_N commands to 0-based policy indices.
+STATE_COMMAND_TO_POLICY_INDEX: dict[StateCommand, int] = {
+    StateCommand[f"SWITCH_POLICY_{n}"]: n - 1 for n in range(1, 10)
+}
 
 
 class BasePolicy:
@@ -68,11 +74,9 @@ class BasePolicy:
         self.default_dof_angles = np.array(self.robot_config.default_dof_angles)
         self.num_upper_dofs = robot_config.num_upper_body_joints
 
-        # Initialize motor limits (only position limits are used)
-        q_max = self.robot_config.joint_pos_max
-        q_min = self.robot_config.joint_pos_min
-        self.q_max_arr: np.array | None = np.array(q_max) if q_max is not None else None
-        self.q_min_arr: np.array | None = np.array(q_min) if q_min is not None else None
+        # Per-robot joint offsets (action-space calibration, does not affect observations)
+        offsets_deg = robot_config.joint_offsets_deg
+        self.joint_offsets = np.deg2rad(offsets_deg) if offsets_deg is not None else np.zeros(self.num_dofs)
 
         # Setup dof names and indices
         self._setup_dof_mappings()
@@ -96,20 +100,18 @@ class BasePolicy:
             self.lower_dof_indices = []
 
     def _init_sdk_components(self):
-        """Initialize SDK components based on robot type."""
+        """Additional SDK components initialization based on robot type."""
+        if hasattr(self, "_shared_hardware_source"):
+            self.sdk_type = self._shared_hardware_source.sdk_type
+            return
         self.sdk_type = self.robot_config.sdk_type
-
-        if self.sdk_type == "unitree":
-            pass  # No channel initialization needed for binding
-        elif self.sdk_type == "ros2":
-            pass
-        elif self.sdk_type == "booster":
+        if self.sdk_type == "booster":
             from booster_robotics_sdk import ChannelFactory
 
             ip = ni.ifaddresses(self.config.task.interface)[ni.AF_INET][0]["addr"]
             ChannelFactory.Instance().Init(self.config.task.domain_id, ip)
         else:
-            raise NotImplementedError(f"SDK type {self.sdk_type} is not supported yet")
+            pass  # No channel initialization needed for Unitree binding / other robots
 
     def _init_obs_config(self):
         """Initialize observation metadata and history buffers."""
@@ -143,12 +145,21 @@ class BasePolicy:
             self.obs_buf_dict[group] = np.concatenate(flattened_terms, axis=1) if flattened_terms else np.zeros((1, 0))
 
     def _init_communication_components(self):
-        """Initialize state processor and command sender using the wrapper."""
-        self.interface = InterfaceWrapper(
+        """Initialize appropriate robot interface."""
+        if hasattr(self, "_shared_hardware_source"):
+            self.interface = self._shared_hardware_source.interface
+            return
+        # The SDK's own wireless-controller path is only needed when an
+        # "interface" channel is selected.  The "joystick" channel is read
+        # via host-side evdev (UsbJoystickInput) and does not touch the SDK.
+        vel = self.config.task.velocity_input
+        other = self.config.task.state_input
+        need_joystick = "interface" in {vel, other}
+        self.interface = create_interface(
             self.robot_config,
             self.config.task.domain_id,
             self.config.task.interface,
-            self.config.task.use_joystick,
+            need_joystick,
         )
 
     def _init_policy_components(self, model_path, policy_action_scale, rl_rate):
@@ -195,9 +206,8 @@ class BasePolicy:
     def _resolve_model_path(self, model_path: str) -> str:
         """Resolve model path, downloading from W&B if required."""
         if model_path.startswith(("wandb://", "https://")):
-            download_dir = self.config.task.wandb_download_dir
             logger.info(f"Downloading checkpoint from W&B: {model_path}")
-            checkpoint_path = load_checkpoint(None, model_path, download_dir)
+            checkpoint_path = load_checkpoint(None, model_path)
             resolved_path = str(checkpoint_path)
             logger.info("Checkpoint downloaded to: %s", resolved_path)
             return resolved_path
@@ -238,23 +248,6 @@ class BasePolicy:
         if announce and len(self.model_paths) > 1 and hasattr(self, "logger"):
             name = Path(self.active_model_path).name
             self.logger.info(colored(f"Switched to policy [{index + 1}]: {name}", "blue"))
-
-    def _try_switch_policy_key(self, keycode: str) -> bool:
-        """Switch policy slot if a numeric key is pressed."""
-        if len(self.model_paths) <= 1:
-            return False
-        if not keycode.isdigit():
-            return False
-        slot = int(keycode)
-        if slot == 0:
-            return False
-        index = slot - 1
-        if index == self.active_policy_index:
-            return True
-        if 0 <= index < len(self.model_paths):
-            self._activate_policy(index)
-            return True
-        return False
 
     def _on_policy_switched(self, model_path: str):
         """Hook for derived classes to reset state after loading a new policy."""
@@ -301,57 +294,91 @@ class BasePolicy:
 
     def _init_input_handlers(self):
         """Initialize input handlers (ROS, joystick, keyboard)."""
+        if hasattr(self, "_shared_hardware_source"):
+            self.logger = self._shared_hardware_source.logger
+            self.rate = self._shared_hardware_source.rate
+            self.rl_rate = self._shared_hardware_source.rl_rate
+            self.use_joystick = self._shared_hardware_source.use_joystick
+            self.use_keyboard = self._shared_hardware_source.use_keyboard
+            # Share input providers — one queue, active policy drains it each cycle.
+            self._velocity_input: VelCmdProvider = self._shared_hardware_source._velocity_input
+            self._command_provider: StateCommandProvider = self._shared_hardware_source._command_provider
+            return
         self._init_rate_handler()
         self._init_input_device()
 
     def _init_rate_handler(self):
-        """Initialize ROS handler if enabled."""
+        """Initialize rate limiter and logger."""
         self.rl_rate = self.config.task.rl_rate
-        if self.config.task.use_ros:
-            import rclpy
-
-            rclpy.init(args=None)
-            self.node = rclpy.create_node("policy_node")
-            self.logger = self.node.get_logger()
-            self.rate = self.node.create_rate(self.rl_rate)
-            thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
-            thread.start()
-        else:
-            self.logger = logger
-            self.rate = RateLimiter(self.rl_rate)
+        self.logger = logger
+        self.rate = RateLimiter(self.rl_rate)
 
     def _init_input_device(self):
-        """Initialize input device (joystick or keyboard)."""
-        if self.config.task.use_joystick:
+        """Initialize input hardware and create input providers.
+
+        Each channel independently selects from InputSource enum values.
+        Hardware is initialized based on the union of both channels' requirements,
+        then providers are created via factory methods (overridden by subclasses).
+        """
+        vel = self.config.task.velocity_input
+        other = self.config.task.state_input
+        sources = {vel, other}
+
+        # Joystick hardware (needed if either channel uses interface or joystick)
+        if {"interface", "joystick"} & sources:
             self._init_joystick_handler()
         else:
-            self._init_keyboard_handler()
+            self.use_joystick = False
+
+        # use_keyboard is set by KeyboardListener when providers start
+        self.use_keyboard = False
+
+        self._create_input_providers()
 
     def _init_joystick_handler(self):
         """Initialize joystick handler."""
         if sys.platform == "darwin":
             self.logger.warning("Joystick is not supported on Windows or Mac.")
-            self.logger.warning("Using keyboard instead")
+            self.logger.warning("Falling back to keyboard for joystick channel")
             self.use_joystick = False
-            self._init_keyboard_handler()
         else:
             self.logger.info("Using joystick")
             self.use_joystick = True
 
-    def _init_keyboard_handler(self):
-        """Initialize keyboard handler."""
-        self.logger.info("Using keyboard")
-        self.use_joystick = False
-        # Check if running in a TTY environment
-        if not sys.stdin.isatty():
-            self.logger.warning("Not running in a TTY environment - keyboard input disabled")
-            self.logger.warning("This is normal for automated tests or non-interactive environments")
-            self.logger.info("Auto-starting policy in non-interactive mode")
-            self.use_policy_action = True
+    def _create_input_providers(self):
+        """Create and start input providers based on config.
+
+        When both channels use the same source, a single provider is shared
+        (important for KeyboardInput which pops from a shared queue).
+        """
+        self._setup_keyboard_listener()
+
+        self._velocity_input: VelCmdProvider = create_input(self, self.config.task.velocity_input, "velocity")
+
+        if self.config.task.velocity_input == self.config.task.state_input:
+            self._command_provider: StateCommandProvider = self._velocity_input
+        else:
+            self._command_provider: StateCommandProvider = create_input(self, self.config.task.state_input, "command")
+
+        self._velocity_input.start()
+        if self._command_provider is not self._velocity_input:
+            self._command_provider.start()
+
+    def _setup_keyboard_listener(self):
+        """Start the shared keyboard listener if any channel uses keyboard input."""
+        if hasattr(self, "_shared_hardware_source"):
             return
-        # Start keyboard listener in a daemon thread
-        threading.Thread(target=self.start_key_listener, daemon=True).start()
-        self.logger.info("Keyboard Listener Initialized")
+        sources = {self.config.task.velocity_input, self.config.task.state_input}
+        if "keyboard" not in sources:
+            return
+        from holosoma_inference.inputs.impl.keyboard import get_keyboard_listener
+
+        listener = get_keyboard_listener()
+        active = listener.start()
+        self.use_keyboard = active
+        if not active:
+            self.logger.warning("No TTY — keyboard input disabled")
+            self.use_policy_action = True
 
     # ============================================================================
     # Policy Methods
@@ -415,12 +442,8 @@ class BasePolicy:
             self.robot_config = replace(
                 self.robot_config, motor_kp=tuple(kp_values.tolist()), motor_kd=tuple(kd_values.tolist())
             )
-            # Update InterfaceWrapper's robot_config reference since replace() creates a new object
-            self.interface.robot_config = self.robot_config
-            # Update sdk2py backend components (booster SDK only)
-            if self.interface.backend == "sdk2py":
-                self.interface.command_sender.config = self.robot_config
-                self.interface.state_processor.config = self.robot_config
+            # Update interface's robot_config and propagate to internal SDK components
+            self.interface.update_config(self.robot_config)
         else:
             # No values available - error
             raise ValueError(
@@ -447,14 +470,67 @@ class BasePolicy:
                 obs_dim_dict[key] += self.obs_dims[obs_name]
         return obs_dim_dict
 
+    def _print_observations(self, obs: dict[str, np.ndarray]) -> None:
+        """Print observation vector with term naming for debugging.
+
+        Args:
+            obs: Dictionary mapping observation group names to their flattened arrays.
+        """
+        np.set_printoptions(suppress=True, precision=3)
+        print("\n========== Observation Vector ==========")
+        for group_name, group_obs in obs.items():
+            print(f"\n{group_name}:")
+            if group_name in self.obs_dict:
+                start_idx = 0
+                for term_name in self.obs_terms_sorted.get(group_name, []):
+                    term_dim = self.obs_dims[term_name]
+                    history_len = self.history_length_dict.get(group_name, 1)
+                    total_dim = term_dim * history_len
+                    term_values = group_obs[0, start_idx : start_idx + total_dim]
+                    print(f"  {term_name:20s} (dim={term_dim:2d}, hist={history_len}): {term_values}")
+                    start_idx += total_dim
+
+        # Joint table: dof_name | q (deg) | dq | action
+        self._print_joint_table(obs)
+        print("========================================\n")
+
+    def _print_joint_table(self, obs: dict[str, np.ndarray]) -> None:
+        """Print a compact per-joint table: name | q(°) | dq(°/s) | act(°)."""
+        # Walk obs_terms_sorted + obs_dims to locate dof_pos / dof_vel slices
+        q = dq = None
+        for grp, buf in obs.items():
+            col = 0
+            for term in self.obs_terms_sorted.get(grp, []):
+                dim = self.obs_dims[term] * self.history_length_dict.get(grp, 1)
+                if q is None and term == "dof_pos":
+                    q = buf[0, col : col + dim] / self.obs_scales.get("dof_pos", 1.0)
+                if dq is None and term == "dof_vel":
+                    dq = buf[0, col : col + dim] / self.obs_scales.get("dof_vel", 1.0)
+                col += dim
+        act = self.scaled_policy_action[0] if self.scaled_policy_action is not None else None
+        d = np.degrees
+        w = max(len(n) for n in self.dof_names)
+        print(f"\n  {'joint':<{w}}  {'q(°)':>7}  {'dq(°/s)':>8}  {'act(°)':>7}")
+        print(f"  {'─' * (w + 29)}")
+        for i, name in enumerate(self.dof_names):
+            qi = f"{d(q[i]):7.1f}" if q is not None and i < len(q) else "    n/a"
+            di = f"{d(dq[i]):8.1f}" if dq is not None and i < len(dq) else "     n/a"
+            ai = f"{d(act[i]):7.1f}" if act is not None and i < len(act) else "    n/a"
+            print(f"  {name:<{w}}  {qi}  {di}  {ai}")
+
     def rl_inference(self, robot_state_data):
         """Perform RL inference to get policy action."""
         obs = self.prepare_obs_for_rl(robot_state_data)
+        if self.config.task.print_observations:
+            self._print_observations(obs)
+
         policy_action = self.policy(obs)
         policy_action = np.clip(policy_action, -100, 100)
 
         self.last_policy_action = policy_action.copy()
         self.scaled_policy_action = policy_action * self.policy_action_scale
+        if self.config.task.debug.force_zero_action:
+            self.scaled_policy_action = np.zeros_like(self.scaled_policy_action)
 
         return self.scaled_policy_action
 
@@ -468,15 +544,27 @@ class BasePolicy:
 
         # Extract base and joint data
         current_obs_buffer_dict["base_quat"] = robot_state_data[:, 3:7]
-        current_obs_buffer_dict["base_ang_vel"] = robot_state_data[:, 7 + self.num_dofs + 3 : 7 + self.num_dofs + 6]
+        if self.config.task.debug.force_zero_angular_velocity:
+            current_obs_buffer_dict["base_ang_vel"] = np.zeros((1, 3))
+        else:
+            current_obs_buffer_dict["base_ang_vel"] = robot_state_data[:, 7 + self.num_dofs + 3 : 7 + self.num_dofs + 6]
         current_obs_buffer_dict["dof_pos"] = robot_state_data[:, 7 : 7 + self.num_dofs] - self.default_dof_angles
         current_obs_buffer_dict["dof_vel"] = robot_state_data[
             :, 7 + self.num_dofs + 6 : 7 + self.num_dofs + 6 + self.num_dofs
         ]
 
-        # Calculate projected gravity
-        v = np.array([[0, 0, -1]])
-        current_obs_buffer_dict["projected_gravity"] = quat_rotate_inverse(current_obs_buffer_dict["base_quat"], v)
+        # Use pre-computed corrected gravity if available from interface, else compute
+        # This logic seems very brittle. TODO: Return a dataclass instead of just a numpy array.
+        expected_len = (
+            7 + self.num_dofs + 6 + self.num_dofs
+        )  # base_pos(3) + quat(4) + dof_pos + lin_vel(3) + ang_vel(3) + dof_vel
+        if self.config.task.debug.force_upright_imu:
+            current_obs_buffer_dict["projected_gravity"] = np.array([[0.0, 0.0, -1.0]])
+        elif robot_state_data.shape[1] == expected_len + 3:
+            current_obs_buffer_dict["projected_gravity"] = robot_state_data[:, expected_len : expected_len + 3]
+        else:
+            v = np.array([[0, 0, -1]])
+            current_obs_buffer_dict["projected_gravity"] = quat_rotate_inverse(current_obs_buffer_dict["base_quat"], v)
 
         return current_obs_buffer_dict
 
@@ -500,6 +588,7 @@ class BasePolicy:
         """Return flattened observations per group with history applied per term."""
         current_obs_buffer_dict = self.get_current_obs_buffer_dict(robot_state_data)
         current_obs_dict = self.parse_current_obs_dict(current_obs_buffer_dict)
+
         return self._update_obs_history(current_obs_dict)
 
     def _update_obs_history(self, current_obs_dict: dict[str, dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -560,6 +649,10 @@ class BasePolicy:
     def policy_action(self):
         """Execute policy action and send commands to robot."""
 
+        # Snapshot flags to prevent race with mode-switch handler thread
+        use_policy = self.use_policy_action
+        get_ready = self.get_ready_state
+
         kp_override = None
         kd_override = None
 
@@ -570,10 +663,10 @@ class BasePolicy:
         # Stage 2: Pre-processing
         with self.latency_tracker.measure("preprocessing"):
             # Determine target joint positions
-            if self.get_ready_state:
+            if get_ready:
                 q_target = self.get_init_target(robot_state_data)
                 self.init_count = min(self.init_count, 500)
-            elif not self.use_policy_action:
+            elif not use_policy:
                 manual_cmd = self._get_manual_command(robot_state_data)
                 if manual_cmd is not None:
                     q_target = manual_cmd["q"]
@@ -586,13 +679,13 @@ class BasePolicy:
                 pass
 
         # Stage 3: Inference
-        if self.use_policy_action and not self.get_ready_state:
+        if use_policy and not get_ready:
             with self.latency_tracker.measure("inference"):
                 scaled_policy_action = self.rl_inference(robot_state_data)
 
         # Stage 4: Post-processing
         with self.latency_tracker.measure("postprocessing"):
-            if self.use_policy_action and not self.get_ready_state:
+            if use_policy and not get_ready:
                 if scaled_policy_action.shape[1] != self.num_dofs:
                     if not self.upper_body_controller:
                         scaled_policy_action = np.concatenate(
@@ -602,12 +695,8 @@ class BasePolicy:
                         raise NotImplementedError("Upper body controller not implemented")
                 q_target = scaled_policy_action + self.default_dof_angles
 
-            # Clip target positions to motor limits (in-place for speed)
-            if self.q_min_arr is not None and self.q_max_arr is not None:
-                np.clip(q_target[0], self.q_min_arr, self.q_max_arr, out=q_target[0])
-
             # Prepare command (reuse pre-allocated arrays)
-            self.cmd_q[:] = q_target[0]
+            self.cmd_q[:] = q_target[0] + self.joint_offsets
 
         # Stage 5: Action Pub
         with self.latency_tracker.measure("action_pub"):
@@ -619,6 +708,19 @@ class BasePolicy:
                 kp_override=kp_override,
                 kd_override=kd_override,
             )
+
+        # Telemetry hook: fires every control tick in every state (policy,
+        # stiff-hold, init ramp) with the final executed command. Default
+        # no-op; override to publish feedback (e.g. ROS topics) without
+        # touching the control loop.
+        self._on_command_sent(self.cmd_q, robot_state_data)
+
+    def _on_command_sent(self, cmd_q, robot_state_data) -> None:
+        """Hook called after each executed command is sent. Override to observe.
+
+        cmd_q: (num_dofs,) full-body joint command actually sent this tick.
+        robot_state_data: (1, state_dim) latest robot state used this tick.
+        """
 
     def _get_manual_command(self, robot_state_data):
         """Optional manual command when policy control is disabled."""
@@ -637,84 +739,54 @@ class BasePolicy:
         self.phase = np.fmod(phase_tp1 + np.pi, 2 * np.pi) - np.pi
 
     # ============================================================================
-    # Input Handler Methods
+    # Velocity Hook
     # ============================================================================
 
-    def start_key_listener(self):
-        """Start keyboard listener thread."""
+    def _apply_velocity(self, vc: VelCmd) -> None:
+        """Apply a velocity command to the policy state.
 
-        def on_press(keycode):
-            try:
-                self.handle_keyboard_button(keycode)
-            except AttributeError:
-                pass  # Handle special keys if needed
-
-        try:
-            listener = listen_keyboard(on_press=on_press)
-            listener.start()
-            listener.join()
-        except OSError as e:
-            # Handle termios errors in non-TTY environments
-            self.logger.warning("Could not start keyboard listener: %s", e)
-            self.logger.warning("Keyboard input will not be available")
-
-    def process_joystick_input(self):
-        """Process joystick input and update commands using InterfaceWrapper."""
-        # Handle stick input
-        self.lin_vel_command, self.ang_vel_command, _ = self.interface.process_joystick_input(
-            self.lin_vel_command, self.ang_vel_command, self.stand_command, False
-        )
-        # Robust key state tracking: update all key states every frame
-        self.last_key_states = self.key_states.copy() if hasattr(self, "key_states") else {}
-        # Build new key_states: all keys False except the current one
-        new_key_states = dict.fromkeys(self.interface._wc_key_map.values(), False)
-        cur_key = self.interface.get_joystick_key()
-        if cur_key:
-            new_key_states[cur_key] = True
-        self.key_states = new_key_states
-        for key, is_pressed in self.key_states.items():
-            if is_pressed and not self.last_key_states.get(key, False):
-                self.handle_joystick_button(key)
-                self._print_control_status()
+        Called from the run loop when a provider returns a non-None VelCmd.
+        Subclasses can override to add gating (e.g. stand_command in locomotion).
+        """
+        self.lin_vel_command[0] = vc.lin_vel
+        self.ang_vel_command[0, 0] = vc.ang_vel
 
     # ============================================================================
-    # Button Handler Methods
+    # Command Dispatch
     # ============================================================================
 
-    def handle_keyboard_button(self, keycode):
-        """Handle keyboard button presses."""
-        if self._try_switch_policy_key(keycode):
-            pass
-        elif keycode == "]":
+    def _dispatch_command(self, cmd):
+        """Dispatch a command enum to the appropriate handler.
+
+        Subclasses override this to handle policy-specific commands,
+        calling ``super()._dispatch_command(cmd)`` for unhandled ones.
+        """
+        if cmd == StateCommand.START:
             self._handle_start_policy()
-        elif keycode == "o":
+        elif cmd == StateCommand.STOP:
             self._handle_stop_policy()
-        elif keycode == "i":
+        elif cmd == StateCommand.INIT:
             self._handle_init_state()
-        elif keycode in ["v", "b", "f", "g", "r"]:
-            self._handle_kp_control(keycode)
-
-        self._print_control_status()
-
-    def handle_joystick_button(self, cur_key):
-        """Handle joystick button presses."""
-        if cur_key == "A":
-            self._handle_start_policy()
-        elif cur_key == "B":
-            self._handle_stop_policy()
-        elif cur_key == "Y":
-            self._handle_init_state()
-        elif cur_key in ["up", "down", "left", "right", "F1"]:
-            # TODO: Make this more intuitive
-            self._handle_joystick_kp_control(cur_key)
-        elif cur_key == "select":
-            # Cycle to next policy
+        elif cmd == StateCommand.KILL:
+            self.logger.info(colored("Killing program via command", "red"))
+            sys.exit(0)
+        elif cmd == StateCommand.NEXT_POLICY:
             next_index = (self.active_policy_index + 1) % len(self.model_paths)
             self._activate_policy(next_index)
-        elif cur_key == "L1+R1":
-            # Kill program, works on G1 joystick only.
-            self.logger.info(colored("Killing program via joystick command", "red"))
-            sys.exit(0)
+        elif cmd in STATE_COMMAND_TO_POLICY_INDEX:
+            index = STATE_COMMAND_TO_POLICY_INDEX[cmd]
+            if index != self.active_policy_index and 0 <= index < len(self.model_paths):
+                self._activate_policy(index)
+        elif cmd == StateCommand.KP_UP:
+            self.interface.kp_level += 0.1
+        elif cmd == StateCommand.KP_DOWN:
+            self.interface.kp_level -= 0.1
+        elif cmd == StateCommand.KP_UP_FINE:
+            self.interface.kp_level += 0.01
+        elif cmd == StateCommand.KP_DOWN_FINE:
+            self.interface.kp_level -= 0.01
+        elif cmd == StateCommand.KP_RESET:
+            self.interface.kp_level = 1.0
 
     # ============================================================================
     # Control Action Methods
@@ -745,33 +817,6 @@ class BasePolicy:
         if hasattr(self.interface, "no_action"):
             self.interface.no_action = 0
 
-    def _handle_kp_control(self, keycode):
-        """Handle keyboard KP control."""
-        if keycode == "v":
-            self.interface.kp_level -= 0.01
-        elif keycode == "b":
-            self.interface.kp_level += 0.01
-        elif keycode == "f":
-            self.interface.kp_level -= 0.1
-        elif keycode == "g":
-            self.interface.kp_level += 0.1
-        elif keycode == "r":
-            self.interface.kp_level = 1.0
-
-    def _handle_joystick_kp_control(self, keycode):
-        """Handle joystick KP control."""
-        print(keycode)
-        if keycode == "down":
-            self.interface.kp_level -= 0.1
-        elif keycode == "up":
-            self.interface.kp_level += 0.1
-        elif keycode == "left":
-            self.interface.kp_level -= 0.01
-        elif keycode == "right":
-            self.interface.kp_level += 0.01
-        elif keycode == "F1":
-            self.interface.kp_level = 1.0
-
     def _print_control_status(self):
         """Print current control status."""
         self.logger.info("------------ Control Status ------------")
@@ -793,8 +838,14 @@ class BasePolicy:
             for it in itertools.count():
                 self.latency_tracker.start_cycle()
 
-                if self.use_joystick and self.interface.get_joystick_msg() is not None:
-                    self.process_joystick_input()
+                vc = self._velocity_input.poll_velocity()
+                if vc is not None:
+                    self._apply_velocity(vc)
+                commands = self._command_provider.poll_commands()
+                for cmd in commands:
+                    self._dispatch_command(cmd)
+                if commands:
+                    self._print_control_status()
                 if self.use_phase:
                     self.update_phase_time()
 

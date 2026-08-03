@@ -1,16 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Exit on error, and print commands
 set -e
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ROOT_DIR=$(dirname "$SCRIPT_DIR")
 
-# MuJoCo Warp version to install -- the repo is missing version tags and branches
-# Arbitrarily chosen from mainline at the time we've ~tested against
-MUJOCO_WARP_COMMIT="09ec1da"
+if ! command -v sudo &> /dev/null; then
+  # in docker build sudo isn't avaiable, but its ok
+  echo "Warning: sudo could not be found, you may need to run this script with sudo"
+  function sudo { "$@"; }
+  export -f sudo
+fi
+
+# MuJoCo Warp version to install -- the repo is missing version tags and branches.
+# Pinned to the 3.10.0 line, which ships the batched-camera renderer API
+# (mujoco_warp.create_render_context / render / get_rgb / get_depth) the WarpBackend uses;
+# the older 09ec1da mainline predated it. mujoco_warp[cuda]'s own deps pull warp-lang>=1.14 from
+# pypi.nvidia.com (public PyPI caps at 1.10.1), installed after holosoma below; holosoma itself only
+# floors warp-lang>=1.10 so the non-mujoco images (plain PyPI) still resolve.
+MUJOCO_WARP_COMMIT="ecaef88917a3c90cd238bf76681ca770f58033df"
 
 # Parse command-line arguments
 INSTALL_WARP=true  # Default: install warp (GPU-accelerated)
+# Skip the runtime NVIDIA driver check before the Warp install. The check needs
+# nvidia-smi, which is unavailable inside `docker build` (no GPU at build time);
+# the GPU is required at run time, not install time. Settable via env for the
+# Dockerfile build-arg path.
+SKIP_DRIVER_CHECK=${SKIP_DRIVER_CHECK:-false}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -19,12 +35,18 @@ while [[ $# -gt 0 ]]; do
       echo "MuJoCo Warp (GPU) installation disabled - CPU-only mode"
       shift
       ;;
+    --skip-driver-check)
+      SKIP_DRIVER_CHECK=true
+      shift
+      ;;
     --help|-h)
-      echo "Usage: $0 [--no-warp]"
+      echo "Usage: $0 [--no-warp] [--skip-driver-check]"
       echo ""
       echo "Options:"
-      echo "  --no-warp      Skip MuJoCo Warp installation (CPU-only)"
-      echo "  --help, -h     Show this help message"
+      echo "  --no-warp            Skip MuJoCo Warp installation (CPU-only)"
+      echo "  --skip-driver-check  Skip the NVIDIA driver check (for GPU-less"
+      echo "                       build environments; GPU still required at run time)"
+      echo "  --help, -h           Show this help message"
       echo ""
       echo "Default: GPU-accelerated installation (WarpBackend + ClassicBackend)"
       echo ""
@@ -35,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo "  # Setup without GPU acceleration (CPU-only)"
       echo "  $0 --no-warp"
       echo ""
-      echo "Note: GPU acceleration requires NVIDIA driver >= 550.54.14"
+      echo "Note: GPU acceleration requires NVIDIA driver >= 555.58.02"
       exit 0
       ;;
     *)
@@ -48,18 +70,44 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Create overall workspace
+
+# Use CONDA_ENV_NAME if provided, otherwise default to "hsmujoco"
+CONDA_ENV_NAME=${CONDA_ENV_NAME:-hsmujoco}
+echo "conda environment name is set to: $CONDA_ENV_NAME"
+
 source ${SCRIPT_DIR}/source_common.sh
-ENV_ROOT=$CONDA_ROOT/envs/hsmujoco
-SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco
-WARP_SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_mujoco_warp
+ENV_ROOT=$CONDA_ROOT/envs/$CONDA_ENV_NAME
+SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_$CONDA_ENV_NAME
+WARP_SENTINEL_FILE=${WORKSPACE_DIR}/.env_setup_finished_$CONDA_ENV_NAME_warp
 
 mkdir -p $WORKSPACE_DIR
 
 if [[ ! -f $SENTINEL_FILE ]]; then
+  # Detect OS and architecture
+  OS_NAME="$(uname -s)"
+  ARCH_NAME="$(uname -m)"
+
   # Install miniconda (reuse existing logic)
   if [[ ! -d $CONDA_ROOT ]]; then
     mkdir -p $CONDA_ROOT
-    curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o $CONDA_ROOT/miniconda.sh
+
+    # Decide installer name based on OS/arch
+    if [[ "$OS_NAME" == "Linux" ]]; then
+      MINICONDA_INSTALLER="Miniconda3-latest-Linux-x86_64.sh"
+    elif [[ "$OS_NAME" == "Darwin" ]]; then
+      if [[ "$ARCH_NAME" == "arm64" ]]; then
+        # Apple Silicon
+        MINICONDA_INSTALLER="Miniconda3-latest-MacOSX-arm64.sh"
+      else
+        # Intel Mac
+        MINICONDA_INSTALLER="Miniconda3-latest-MacOSX-x86_64.sh"
+      fi
+    else
+      echo "Unsupported OS: $OS_NAME"
+      exit 1
+    fi
+
+    curl "https://repo.anaconda.com/miniconda/${MINICONDA_INSTALLER}" -o "$CONDA_ROOT/miniconda.sh"
     bash $CONDA_ROOT/miniconda.sh -b -u -p $CONDA_ROOT
     rm $CONDA_ROOT/miniconda.sh
   fi
@@ -69,10 +117,10 @@ if [[ ! -f $SENTINEL_FILE ]]; then
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
     $CONDA_ROOT/bin/conda install -y mamba -c conda-forge -n base
-    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n hsmujoco python=3.10 -c conda-forge --override-channels
+    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n $CONDA_ENV_NAME python=3.10 -c conda-forge --override-channels
   fi
 
-  source $CONDA_ROOT/bin/activate hsmujoco
+  source $CONDA_ROOT/bin/activate $CONDA_ENV_NAME
 
   # Install system dependencies for MuJoCo
   # Note: These may require sudo access - document this requirement
@@ -80,8 +128,10 @@ if [[ ! -f $SENTINEL_FILE ]]; then
   # sudo apt-get update
   # sudo apt-get install -y libgl1-mesa-dev libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev
 
-  # Install libstdcxx-ng to fix potential GLIBCXX issues
-  conda install -c conda-forge -y libstdcxx-ng
+  # Install libstdcxx-ng to fix potential GLIBCXX issues (Linux only)
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    conda install -c conda-forge -y libstdcxx-ng
+  fi
 
   # Install ffmpeg for video encoding (consistent with other envs)
   conda install -c conda-forge -y ffmpeg
@@ -101,8 +151,17 @@ if [[ ! -f $SENTINEL_FILE ]]; then
   #pip install numpy scipy matplotlib
 
   # Install Holosoma packages
+  echo "Installing Holosoma packages"
   pip install -U pip
-  pip install -e $ROOT_DIR/src/holosoma[unitree,booster]
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    pip install -e "$ROOT_DIR/src/holosoma[unitree, booster]"
+  elif [[ "$OS_NAME" == "Darwin" ]]; then
+    echo "Warning: only unitree support for osx"
+    pip install -e "$ROOT_DIR/src/holosoma[unitree]"
+  else
+    echo "Unsupported OS: $OS_NAME"
+    exit 1
+  fi
 
   # Validate MuJoCo installation
   echo "Validating MuJoCo installation..."
@@ -175,14 +234,16 @@ if [[ "$INSTALL_WARP" == "true" ]] && [[ ! -f $WARP_SENTINEL_FILE ]]; then
   echo "Installing MuJoCo Warp (GPU acceleration)..."
 
   # Ensure conda environment is activated
-  source $CONDA_ROOT/bin/activate hsmujoco
+  source $CONDA_ROOT/bin/activate $CONDA_ENV_NAME
 
   # Check NVIDIA driver version (required for CUDA 12.4+)
-  MIN_DRIVER_VERSION="550.54.14"
+  MIN_DRIVER_VERSION="555.58.02"
   DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)
 
   # Check if driver exists and meets minimum version
-  if [ -z "$DRIVER_VERSION" ] || [[ "$DRIVER_VERSION" < "$MIN_DRIVER_VERSION" ]]; then
+  if [[ "$SKIP_DRIVER_CHECK" == "true" ]]; then
+    echo "Skipping NVIDIA driver check (--skip-driver-check); GPU required at run time"
+  elif [ -z "$DRIVER_VERSION" ] || [[ "$DRIVER_VERSION" < "$MIN_DRIVER_VERSION" ]]; then
     echo ""
     echo "❌ ERROR: NVIDIA driver not found or too old!"
     echo ""
@@ -200,7 +261,7 @@ if [[ "$INSTALL_WARP" == "true" ]] && [[ ! -f $WARP_SENTINEL_FILE ]]; then
     echo "Install/Upgrade NVIDIA driver:"
     echo "  1. Check available drivers: ubuntu-drivers devices"
     echo "  2. Install recommended:    sudo ubuntu-drivers install"
-    echo "  3. Or install specific:    sudo ubuntu-drivers install nvidia:550"
+    echo "  3. Or install specific:    sudo ubuntu-drivers install nvidia:590"
     echo "  4. Reboot:                 sudo reboot"
     echo ""
     echo "Reference: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/"
@@ -210,7 +271,9 @@ if [[ "$INSTALL_WARP" == "true" ]] && [[ ! -f $WARP_SENTINEL_FILE ]]; then
     exit 1
   fi
 
-  echo "✓ NVIDIA driver version: $DRIVER_VERSION (meets minimum $MIN_DRIVER_VERSION)"
+  if [[ -n "$DRIVER_VERSION" ]]; then
+    echo "✓ NVIDIA driver version: $DRIVER_VERSION (meets minimum $MIN_DRIVER_VERSION)"
+  fi
 
   if [[ ! -d $WORKSPACE_DIR/mujoco_warp ]]; then
     git clone https://github.com/google-deepmind/mujoco_warp.git $WORKSPACE_DIR/mujoco_warp && \

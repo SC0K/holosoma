@@ -7,12 +7,53 @@ for different robot types.
 from __future__ import annotations
 
 from holosoma_inference.config.config_types.robot import RobotConfig
+from holosoma_inference.utils.config_registry import (
+    ConfigRegistry,
+    deprecated_defaults_alias,
+    deprecated_get_defaults,
+)
+
+ROBOT_REGISTRY = ConfigRegistry(RobotConfig, group="holosoma.config.robot")
 
 # =============================================================================
 # G1 Robot Config
 # =============================================================================
 
 # fmt: off
+
+# G1 29-DOF per-joint action scales for BeyondMimic-style scaling (0.25 * effort / p_gain).
+# TODO: this is legacy for onnx that do not have action scale vector in metadata
+G1_29DOF_PER_JOINT_ACTION_SCALE = (
+    0.547546465219,
+    0.350661466378,
+    0.547546465219,
+    0.350661466378,
+    0.438577313919,
+    0.438577313919,
+    0.547546465219,
+    0.350661466378,
+    0.547546465219,
+    0.350661466378,
+    0.438577313919,
+    0.438577313919,
+    0.547546465219,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.074500870329,
+    0.074500870329,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.438577313919,
+    0.074500870329,
+    0.074500870329,
+)
 
 g1_29dof = RobotConfig(
     # Identity
@@ -44,36 +85,6 @@ g1_29dof = RobotConfig(
         0.0, 0.0, 0.0,  # waist
         0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,  # left arm
         0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0,  # right arm
-    ),
-
-    # Limits
-    joint_pos_min=(
-        -2.5307, -0.5236, -2.7576, -0.087267, -0.87267, -0.2618,  # left leg
-        -2.5307, -2.9671, -2.7576, -0.087267, -0.87267, -0.2618,  # right leg
-        -2.618, -0.52, -0.52,  # waist
-        -3.0892, -1.5882, -2.618, -1.0472, -1.972222054, -1.61443, -1.61443,  # left arm
-        -3.0892, -2.2515, -2.618, -1.0472, -1.972222054, -1.61443, -1.61443,  # right arm
-    ),
-    joint_pos_max=(
-        2.8798, 2.9671, 2.7576, 2.8798, 0.5236, 0.2618,  # left leg
-        2.8798, 0.5236, 2.7576, 2.8798, 0.5236, 0.2618,  # right leg
-        2.618, 0.52, 0.52,  # waist
-        2.6704, 2.2515, 2.618, 2.0944, 1.972222054, 1.61443, 1.61443,  # left arm
-        2.6704, 1.5882, 2.618, 2.0944, 1.972222054, 1.61443, 1.61443,  # right arm
-    ),
-    joint_vel_limit=(
-        32.0, 20.0, 32.0, 20.0, 37.0, 37.0,  # left leg
-        32.0, 20.0, 32.0, 20.0, 37.0, 37.0,  # right leg
-        32.0, 37.0, 37.0,  # waist
-        37.0, 37.0, 37.0, 37.0, 37.0, 22.0, 22.0,  # left arm
-        37.0, 37.0, 37.0, 37.0, 37.0, 22.0, 22.0,  # right arm
-    ),
-    motor_effort_limit=(
-        88.0, 139.0, 88.0, 139.0, 50.0, 50.0,  # left leg
-        88.0, 139.0, 88.0, 139.0, 50.0, 50.0,  # right leg
-        88.0, 50.0, 50.0,  # waist
-        25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,  # left arm
-        25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,  # right arm
     ),
 
     # Mappings
@@ -133,6 +144,7 @@ g1_29dof = RobotConfig(
         "right_wrist_roll_joint": 26, "right_wrist_pitch_joint": 27, "right_wrist_yaw_joint": 28,
     },
     motion={"body_name_ref": ["torso_link"]},
+    default_per_joint_action_scale=G1_29DOF_PER_JOINT_ACTION_SCALE,
 )
 
 
@@ -172,40 +184,6 @@ t1_29dof = RobotConfig(
         0.0,  # waist
         -0.2, 0.0, 0.0, 0.4, -0.25, 0.0,  # left leg
         -0.2, 0.0, 0.0, 0.4, -0.25, 0.0,  # right leg
-    ),
-
-    # Limits
-    joint_pos_min=(
-        -1.57, -0.35,  # head
-        -3.31, -1.74, -2.27, -2.27, -2.27, -2.27, -2.27,  # left arm
-        -3.31, -1.57, -2.27, -2.27, -2.27, -2.27, -2.27,  # right arm
-        -1.57,  # waist
-        -1.8, -0.3, -1.0, 0.0, -0.87, -0.44,  # left leg
-        -1.8, -1.57, -1.0, 0.0, -0.87, -0.44,  # right leg
-    ),
-    joint_pos_max=(
-        1.57, 1.22,  # head
-        1.22, 1.57, 2.27, 2.27, 2.27, 2.27, 2.27,  # left arm
-        1.22, 1.74, 2.27, 2.27, 2.27, 2.27, 2.27,  # right arm
-        1.57,  # waist
-        1.57, 1.57, 1.0, 2.34, 0.35, 0.44,  # left leg
-        1.57, 0.3, 1.0, 2.34, 0.35, 0.44,  # right leg
-    ),
-    joint_vel_limit=(
-        12.56, 12.56,  # head
-        18.84, 18.84, 18.84, 18.84, 18.84, 18.84, 18.84,  # left arm
-        18.84, 18.84, 18.84, 18.84, 18.84, 18.84, 18.84,  # right arm
-        10.88,  # waist
-        12.5, 10.9, 10.9, 11.7, 18.8, 12.4,  # left leg
-        12.5, 10.9, 10.9, 11.7, 18.8, 12.4,  # right leg
-    ),
-    motor_effort_limit=(
-        7.0, 7.0,  # head
-        18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0,  # left arm
-        18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0,  # right arm
-        30.0,  # waist
-        45.0, 30.0, 30.0, 60.0, 12.0, 12.0,  # left leg
-        45.0, 30.0, 30.0, 60.0, 12.0, 12.0,  # right leg
     ),
 
     # Mappings
@@ -254,11 +232,9 @@ t1_29dof = RobotConfig(
 # Default Configurations Dictionary
 # =============================================================================
 
-DEFAULTS = {
-    "g1-29dof": g1_29dof,
-    "t1-29dof": t1_29dof,
-}
-"""Dictionary of all available robot configurations.
+# Register core presets. Keys use hyphen-case naming convention for CLI compatibility.
+ROBOT_REGISTRY.add("g1-29dof", g1_29dof)
+ROBOT_REGISTRY.add("t1-29dof", t1_29dof)
 
-Keys use hyphen-case naming convention for CLI compatibility.
-"""
+__getattr__ = deprecated_defaults_alias(__name__, ROBOT_REGISTRY)
+get_defaults = deprecated_get_defaults(__name__, ROBOT_REGISTRY)

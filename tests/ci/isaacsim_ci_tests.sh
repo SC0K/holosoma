@@ -2,10 +2,18 @@
 # CI runs this inside holosoma docker
 set -ex
 
-source /workspace/holosoma/scripts/source_isaacsim_setup.sh
-python -m pip install -e /workspace/holosoma/src/holosoma[unitree]
-python -m pip install -e /workspace/holosoma/src/holosoma[booster]
-python -m pip install -e /workspace/holosoma/src/holosoma_inference
 
 cd /workspace/holosoma
-python -m pytest -s -m "isaacsim" --ignore=holosoma/holosoma/envs/legged_base_task/tests/ --ignore=thirdparty
+
+source scripts/source_isaacsim_setup.sh
+python -m pip install -e 'src/holosoma[unitree,booster]'
+python -m pip install -e src/holosoma_inference
+
+marker="isaacsim"
+if [[ "$HOLOSOMA_MULTIGPU" == "True" ]]; then
+   marker="$marker and multi_gpu"
+elif [[ "$HOLOSOMA_MULTIGPU" == "False" ]]; then
+   marker="$marker and not multi_gpu"
+fi
+
+python -m pytest -s --strict-markers -m "$marker" --ignore=thirdparty --ignore=src/holosoma_inference

@@ -61,7 +61,9 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:g1-29d
     --task.interface eth0
 ```
 
-**Note**: Replace `eth0` with your network interface name (e.g., `enp0s31f6`). Find it using `ifconfig`.
+**Notes**:
+- Replace `eth0` with your network interface name (e.g., `enp0s31f6`). Find it using `ifconfig`.
+- For mixed input setups (e.g., ROS2 velocity + keyboard commands), see the [Input Sources](../../README.md#input-sources) section.
 
 #### 2. Start the Policy
 
@@ -133,6 +135,7 @@ python3 src/holosoma_inference/holosoma_inference/run_policy.py inference:t1-29d
 - Replace `eth0` with your network interface name (e.g., `enp0s31f6`). Find it using `ifconfig`.
 - **Joystick control**: If using joystick, use the custom joystick connected to the laptop (not the default Booster T1 remote controller) for all policy controls.
 - **Keyboard control**: Remove `--task.use-joystick` flag to control the robot with keyboard commands instead.
+- **Mixed input**: Use `--task.velocity-input` and `--task.state-input` individually for mixed setups (e.g., ROS2 velocity + keyboard commands). See the [Input Sources](../../README.md#input-sources) section for details.
 
 #### 2. Start the Policy
 
@@ -236,7 +239,8 @@ Run the policy inside a Docker container (works both onboard and offboard).
 
 2. Build the Docker image:
    ```bash
-   bash holosoma/src/holosoma_inference/docker/build.sh
+   ECR_REGISTRY="account-id.dkr.ecr.region.amazonaws.com" \
+     bash holosoma/src/holosoma_inference/docker/build.sh
    ```
 
 3. Create and enter the Docker container:

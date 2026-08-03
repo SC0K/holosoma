@@ -1,19 +1,19 @@
+from __future__ import annotations
+
 import json
 import sys
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import onnx
 import onnxruntime
-import pinocchio as pin
-from defusedxml import ElementTree
 from loguru import logger
 from termcolor import colored
 
 from holosoma_inference.config.config_types.inference import InferenceConfig
-from holosoma_inference.config.config_types.robot import RobotConfig
 from holosoma_inference.policies import BasePolicy
+from holosoma_inference.policies.wbt_utils import MotionClockUtil, PinocchioRobot, TimestepUtil
 from holosoma_inference.utils.clock import ClockSub
-from holosoma_inference.utils.math.misc import get_index_of_a_in_b
 from holosoma_inference.utils.math.quat import (
     matrix_from_quat,
     quat_mul,
@@ -25,82 +25,52 @@ from holosoma_inference.utils.math.quat import (
 )
 
 
-class PinocchioRobot:
-    def __init__(self, robot_cfg: RobotConfig, urdf_text: str):
-        # create pinocchio robot
-        xml_text = self._create_xml_from_urdf(urdf_text)
-        self.robot_model = pin.buildModelFromXML(xml_text, pin.JointModelFreeFlyer())
-        self.robot_data = self.robot_model.createData()
+@runtime_checkable
+class TargetSource(Protocol):
+    """Supplies the tracking target, replacing the ONNX clip. Always returns a
+    valid ``(motion_command (1, 2*num_dofs), ref_quat_xyzw (4,))``."""
 
-        # get joint names in pinocchio robot and real robot
-        joint_names_in_real_robot = robot_cfg.dof_names
-        joint_names_in_pinocchio_robot = [
-            name for name in self.robot_model.names if name not in ["universe", "root_joint"]
-        ]
-        assert len(joint_names_in_pinocchio_robot) == len(joint_names_in_real_robot), (
-            "The number of joints in the pinocchio robot and the real robot are not the same"
-        )
-        self.real2pinocchio_index = get_index_of_a_in_b(joint_names_in_pinocchio_robot, joint_names_in_real_robot)
-
-        # get ref body frame id in pinocchio robot
-        self.ref_body_frame_id = self.robot_model.getFrameId(robot_cfg.motion["body_name_ref"][0])
-
-    def fk_and_get_ref_body_orientation_in_world(self, configuration: np.ndarray) -> np.ndarray:
-        # forward kinematics
-        pin.framesForwardKinematics(self.robot_model, self.robot_data, configuration)
-
-        # get ref body pose in world
-        ref_body_pose_in_world = self.robot_data.oMf[self.ref_body_frame_id]
-        quaternion = pin.Quaternion(ref_body_pose_in_world.rotation)  # (4, )
-
-        return np.expand_dims(quaternion.coeffs(), axis=0)  # xyzw, (1, 4)
-
-    @staticmethod
-    def _create_xml_from_urdf(urdf_text: str) -> str:
-        """Strip visuals/collisions from URDF text and return XML text."""
-        root = ElementTree.fromstring(urdf_text)
-
-        def _is_visual_or_collision(tag: str) -> bool:
-            # Handle optional XML namespaces by only checking the suffix after '}'.
-            return tag.split("}")[-1] in {"visual", "collision"}
-
-        for parent in root.iter():
-            for child in list(parent):
-                if _is_visual_or_collision(child.tag):
-                    parent.remove(child)
-
-        xml_text = ElementTree.tostring(root, encoding="unicode")
-        if not xml_text.lstrip().startswith("<?xml"):
-            xml_text = '<?xml version="1.0"?>\n' + xml_text
-        return xml_text
+    def get_target(self, num_dofs: int, rl_rate_hz: float, urdf_path: str | None): ...
 
 
 class WholeBodyTrackingPolicy(BasePolicy):
     def __init__(self, config: InferenceConfig):
-        # initialize timestep
-        self.motion_timestep = 0
+        self.config = config
+
+        # Injected target source (NPZ / teleop). Unset -> ONNX clip.
+        # Subclasses (e.g. HolosomaWBTPolicy) set this *before* calling
+        # super().__init__(), so don't clobber an already-injected source.
+        if not hasattr(self, "_target_source"):
+            self._target_source: TargetSource | None = None
+
+        # initialize motion state
         self.motion_clip_progressing = False
-        self.motion_start_timestep = None
+        self.curr_motion_timestep = config.task.motion_start_timestep
         self.motion_command_t = None
         self.ref_quat_xyzw_t = None
         self.motion_command_0 = None
         self.ref_quat_xyzw_0 = None
 
-        # Calculate timestep interval from rl_rate (e.g., 50Hz = 20ms intervals)
-        self.timestep_interval_ms = 1000.0 / config.task.rl_rate
-
-        # Initialize clock subscriber for synchronization
-        self.clock_sub = ClockSub()
-        self.clock_sub.start()
-        self._last_clock_reading: int | None = None
+        # Initialize clock for sim-time synchronization
+        clock_sub = ClockSub()
+        clock_sub.start()
+        clock_util = MotionClockUtil(clock_sub)
+        self.timestep_util = TimestepUtil(
+            clock=clock_util,
+            interval_ms=1000.0 / config.task.rl_rate,
+            start_timestep=config.task.motion_start_timestep,
+        )
 
         # Read use_sim_time from config
         self.use_sim_time = config.task.use_sim_time
 
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
+        self.motion_yaw_offset = 0.0
+        self.per_joint_policy_action_scale: np.ndarray | None = None
 
         super().__init__(config)
+        self._configure_action_scales()
 
         # Load stiff startup parameters from robot config
         if config.robot.stiff_startup_pos is not None:
@@ -132,7 +102,13 @@ class WholeBodyTrackingPolicy(BasePolicy):
                 )
             )
 
-        if sys.stdin.isatty():
+        if hasattr(self, "_shared_hardware_source"):
+            logger.info(colored("Skipping stiff hold prompt (secondary policy)", "yellow"))
+        elif self.config.task.skip_stiff_prompt:
+            # Non-interactive launches (service node, eval) skip the blocking
+            # stdin gate and enter stiff hold immediately (config default True).
+            logger.info(colored("✓ Entering stiff hold mode (skip_stiff_prompt)", "green"))
+        elif sys.stdin.isatty():
             logger.info(colored("\n⚠️  Ready to enter stiff hold mode", "yellow", attrs=["bold"]))
             logger.info(colored("Press Enter to continue...", "yellow"))
             try:
@@ -189,8 +165,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
 
             logger.info(f"Loaded KP/KD from ONNX metadata: {Path(model_path).name}")
 
-        # get initial command and ref quat xyzw
-        time_step = np.zeros((1, 1), dtype=np.float32)
+        # get initial command and ref quat xyzw at the configured start timestep
+        time_step = np.array([[self.config.task.motion_start_timestep]], dtype=np.float32)
 
         # Use configured observation dimensions (including history) instead of a hard-coded value.
         actor_obs_template = self.obs_buf_dict.get("actor_obs")
@@ -222,6 +198,9 @@ class WholeBodyTrackingPolicy(BasePolicy):
             {
                 "motion_command_0": self.motion_command_0.copy(),
                 "ref_quat_xyzw_0": self.ref_quat_xyzw_0.copy(),
+                "per_joint_policy_action_scale": self.per_joint_policy_action_scale.copy()
+                if self.per_joint_policy_action_scale is not None
+                else None,
             }
         )
         return state
@@ -230,22 +209,25 @@ class WholeBodyTrackingPolicy(BasePolicy):
         super()._restore_policy_state(state)
         self.motion_command_0 = state["motion_command_0"].copy()
         self.ref_quat_xyzw_0 = state["ref_quat_xyzw_0"].copy()
+        saved = state["per_joint_policy_action_scale"]
+        self.per_joint_policy_action_scale = saved.copy() if saved is not None else None
         self.motion_clip_progressing = False
-        self.motion_timestep = 0
-        self.motion_start_timestep = None
-        self._last_clock_reading = None
+        self.timestep_util.reset(start_timestep=0)
+        self.curr_motion_timestep = self.timestep_util.timestep
         self.robot_yaw_offset = 0.0
+        self.motion_yaw_offset = 0.0
 
     def _on_policy_switched(self, model_path: str):
         super()._on_policy_switched(model_path)
         self.motion_command_t = self.motion_command_0.copy()
         self.ref_quat_xyzw_t = self.ref_quat_xyzw_0.copy()
         self.motion_clip_progressing = False
-        self.motion_timestep = 0
-        self.motion_start_timestep = None
-        self._last_clock_reading = None
+        self.timestep_util.reset(start_timestep=0)
+        self.curr_motion_timestep = self.timestep_util.timestep
         self._stiff_hold_active = True
         self.robot_yaw_offset = 0.0
+        self.motion_yaw_offset = 0.0
+        self._configure_action_scales()
 
     def get_init_target(self, robot_state_data):
         """Get initialization target joint positions."""
@@ -295,29 +277,95 @@ class WholeBodyTrackingPolicy(BasePolicy):
     def rl_inference(self, robot_state_data):
         # prepare obs, run policy inference
         if not self.motion_clip_progressing:
-            # Keep motion index pinned at the start while waiting to trigger the clip.
-            self.motion_timestep = 0
-            self.motion_start_timestep = None
-            self._last_clock_reading = None
+            # Keep motion index pinned at the configured start while waiting to trigger the clip.
+            self.timestep_util.reset(start_timestep=self.config.task.motion_start_timestep)
+            self.curr_motion_timestep = self.timestep_util.timestep
 
         obs = self.prepare_obs_for_rl(robot_state_data)
-        input_feed = {"time_step": np.array([[self.motion_timestep]], dtype=np.float32), "obs": obs["actor_obs"]}
+        if self.config.task.print_observations:
+            self._print_observations(obs)
+
+        input_feed = {"time_step": np.array([[self.curr_motion_timestep]], dtype=np.float32), "obs": obs["actor_obs"]}
         policy_action, self.motion_command_t, self.ref_quat_xyzw_t = self.policy(input_feed)
+
+        # Override the ONNX's self-generated clip target with the injected source.
+        if self._target_source is not None:
+            self.motion_command_t, self.ref_quat_xyzw_t = self._target_source.get_target(
+                self.num_dofs, self.config.task.rl_rate, getattr(self.config.robot, "urdf_path", None)
+            )
 
         # clip policy action
         policy_action = np.clip(policy_action, -100, 100)
         # store last policy action
         self.last_policy_action = policy_action.copy()
         # scale policy action
-        self.scaled_policy_action = policy_action * self.policy_action_scale
-
+        if self.per_joint_policy_action_scale is None:
+            self.scaled_policy_action = policy_action * self.policy_action_scale
+        else:
+            self.scaled_policy_action = policy_action * self.per_joint_policy_action_scale
         # update motion timestep
-        if self.motion_clip_progressing:
-            if self.use_sim_time:
-                self._update_clock()
-            else:
-                self.motion_timestep += 1
+        self._set_motion_timestep()
+
         return self.scaled_policy_action
+
+    def _configure_action_scales(self) -> None:
+        """Configure action scales, prioritising ONNX metadata over config fallbacks.
+
+        Resolution order:
+        1. ONNX metadata ``action_scale`` (scalar or per-joint list)
+        2. ``robot.default_per_joint_action_scale`` when
+           ``task.action_scales_by_effort_limit_over_p_gain`` is True
+        3. Fall back to the scalar ``task.policy_action_scale``
+        """
+        raw_metadata = dict(self.onnx_policy_session.get_modelmeta().custom_metadata_map)
+        onnx_action_scale = self._parse_action_scale_metadata(raw_metadata.get("action_scale"))
+
+        if onnx_action_scale is not None:
+            scales = onnx_action_scale.astype(np.float32, copy=False).reshape(-1)
+        elif self.config.task.action_scales_by_effort_limit_over_p_gain:
+            fallback = self.config.robot.default_per_joint_action_scale
+            if fallback is None:
+                raise ValueError(
+                    "task.action_scales_by_effort_limit_over_p_gain=True requires ONNX metadata key "
+                    "'action_scale' (scalar or per-joint list) or "
+                    "robot.default_per_joint_action_scale."
+                )
+            scales = np.asarray(fallback, dtype=np.float32).reshape(-1)
+            logger.warning("ONNX metadata 'action_scale' missing; using robot.default_per_joint_action_scale.")
+        else:
+            self.per_joint_policy_action_scale = None
+            return
+
+        if scales.size == 1:
+            scales = np.full(self.num_dofs, scales.item(), dtype=np.float32)
+        elif scales.size != self.num_dofs:
+            raise ValueError(f"Action scale must contain 1 or {self.num_dofs} values, got {scales.size}.")
+
+        self.per_joint_policy_action_scale = scales.reshape(1, -1)
+
+    @staticmethod
+    def _parse_action_scale_metadata(raw_value: str | None) -> np.ndarray | None:
+        """Parse action_scale metadata from JSON-serialized or CSV string formats."""
+        if raw_value is None:
+            return None
+
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            parsed = raw_value
+
+        if isinstance(parsed, (int, float)):
+            return np.array([float(parsed)], dtype=np.float32)
+        if isinstance(parsed, str):
+            values = [float(token.strip()) for token in parsed.split(",") if token.strip()]
+            if not values:
+                raise ValueError("ONNX metadata action_scale is an empty string.")
+            return np.array(values, dtype=np.float32)
+
+        values = np.asarray(parsed, dtype=np.float32).reshape(-1)
+        if values.size == 0:
+            raise ValueError("ONNX metadata action_scale is empty.")
+        return values
 
     def _get_manual_command(self, robot_state_data):
         # TODO: instead of adding kp/kd_override in def _set_motor_command,
@@ -336,42 +384,23 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self._capture_robot_yaw_offset()
         self._capture_motion_yaw_offset(self.ref_quat_xyzw_0)
 
-    def _update_clock(self):
-        # Use synchronized clock with motion-relative timing
-        current_clock = self.clock_sub.get_clock()
-        if self.motion_start_timestep is None:
-            # Motion just started; anchor to the first received clock tick.
-            self.motion_start_timestep = current_clock
-        elif self._last_clock_reading is not None and current_clock < self._last_clock_reading:
-            # Simulator clock jumped backwards (e.g., reset). Re-anchor start time while preserving progress.
-            offset_ms = round(self.motion_timestep * self.timestep_interval_ms)
-            self.logger.warning("Clock sync returned earlier timestamp; adjusting motion timing anchor.")
-            self.motion_start_timestep = current_clock - offset_ms
-        self._last_clock_reading = current_clock
-        elapsed_ms = current_clock - self.motion_start_timestep
-        if self.motion_timestep == 0 and int(elapsed_ms // self.timestep_interval_ms) > 1:
-            self.logger.warning(
-                "Still at the beginning but the clock jumped ahead: elapsed_ms={elapsed_ms}, self.timestep_interval_ms="
-                "{timestep_interval_ms}, self.motion_timestep={motion_timestep}. "
-                "Re-anchoring to the current timestamp so the motion always starts from frame 0.",
-                elapsed_ms=elapsed_ms,
-                timestep_interval_ms=self.timestep_interval_ms,
-                motion_timestep=self.motion_timestep,
-            )
-            # Still at the beginning but the clock jumped ahead (e.g., due to waiting before start).
-            # Re-anchor to the current timestamp so the motion always starts from frame 0.
-            self.motion_start_timestep = current_clock
-            self._last_clock_reading = current_clock
-            self.motion_timestep = 0
-            return
-        previous_motion_timestep = self.motion_timestep
-        self.motion_timestep = int(elapsed_ms // self.timestep_interval_ms)
-        if self.motion_timestep != previous_motion_timestep:
-            self.logger.info(
-                "Motion timestep advanced from {previous_motion_timestep} to {motion_timestep}",
-                previous_motion_timestep=previous_motion_timestep,
-                motion_timestep=self.motion_timestep,
-            )
+    def _set_motion_timestep(self):
+        if self.motion_clip_progressing:
+            prev = self.curr_motion_timestep
+
+            if self.use_sim_time:
+                self.curr_motion_timestep = self.timestep_util.get_timestep(log=self.logger)
+            else:
+                self.curr_motion_timestep += 1
+
+            if self.curr_motion_timestep != prev:
+                self.logger.debug(f"Motion timestep: {prev} → {self.curr_motion_timestep}")
+
+            # Stop motion clip at configured end timestep (keep policy running at final pose)
+            if (end := self.config.task.motion_end_timestep) and self.curr_motion_timestep >= end:
+                self.logger.info(colored(f"Reached end timestep {end}, stopping motion clip", "yellow"))
+                self.motion_clip_progressing = False
+                self.curr_motion_timestep = end
 
     def _handle_stop_policy(self):
         """Handle stop policy action."""
@@ -383,40 +412,33 @@ class WholeBodyTrackingPolicy(BasePolicy):
             self.interface.no_action = 0
 
         self.motion_clip_progressing = False
-        self.motion_timestep = 0
-        self.motion_start_timestep = None  # Reset motion start time
+        self.timestep_util.reset(start_timestep=0)
+        self.curr_motion_timestep = self.timestep_util.timestep
         self.ref_quat_xyzw_t = self.ref_quat_xyzw_0.copy()
         self.motion_command_t = self.motion_command_0.copy()
-        self._last_clock_reading = None
         self.robot_yaw_offset = 0.0
+        self.motion_yaw_offset = 0.0
 
     def _handle_start_motion_clip(self):
         """Handle start motion clip action."""
-        self.clock_sub.reset_origin()
+        self.timestep_util.reset(start_timestep=self.config.task.motion_start_timestep)
+        self.curr_motion_timestep = self.timestep_util.timestep
         self.motion_clip_progressing = True
-        # Capture motion-specific start timestep for policy-level timing control
-        self.motion_start_timestep = None  # will be set in rl_inference
-        self.motion_timestep = 0  # Reset to start from beginning of motion
-        self._last_clock_reading = None
-        self.logger.info(colored("Starting motion clip", "blue"))
 
-    def handle_keyboard_button(self, keycode):
-        """Add new keyboard button to start and end the motion clips"""
-        if keycode == "s":
-            self.clock_sub.reset_origin()
+        if self.config.task.motion_start_timestep > 0 or self.config.task.motion_end_timestep is not None:
+            start_str = str(self.config.task.motion_start_timestep)
+            end_str = str(self.config.task.motion_end_timestep) if self.config.task.motion_end_timestep else "end"
+            self.logger.info(colored(f"Starting motion clip from timestep {start_str} to {end_str}", "blue"))
+        else:
+            self.logger.info(colored("Starting motion clip", "blue"))
+
+    def _dispatch_command(self, cmd):
+        from holosoma_inference.inputs.api.commands import StateCommand
+
+        if cmd == StateCommand.START_MOTION_CLIP:
             self._handle_start_motion_clip()
         else:
-            super().handle_keyboard_button(keycode)
-
-    def handle_joystick_button(self, cur_key):
-        """Handle joystick button presses for WBT-specific controls."""
-        if cur_key == "start":
-            # Start playing motion clip
-            self._handle_start_motion_clip()
-        else:
-            # Delegate all other buttons to base class
-            super().handle_joystick_button(cur_key)
-        super()._print_control_status()
+            super()._dispatch_command(cmd)
 
     def _capture_robot_yaw_offset(self):
         """Capture robot yaw when policy starts to use as reference offset."""

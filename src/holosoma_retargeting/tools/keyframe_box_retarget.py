@@ -1022,7 +1022,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dst-box-quat-wxyz",
         type=_parse_quat_wxyz,
-        default=np.array([ 0.0, -0.545,  0.839, 0.0 ], dtype=np.float64),
+        default=np.array([ 0.0,  0.966,  -0.259, 0.0 ], dtype=np.float64),
         help="Target box orientation quaternion w,x,y,z (default identity).",
     )
     p.add_argument(
