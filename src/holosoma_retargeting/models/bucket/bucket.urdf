@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<robot name="bucket">
+  <link name="bucket_link">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="0.5"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+    <visual name="part_00_solid_body">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_00_solid_body.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <visual name="part_01_handle_pos_lower">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_01_handle_pos_lower.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <visual name="part_02_handle_pos_upper">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_02_handle_pos_upper.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <visual name="part_03_handle_neg_lower">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_03_handle_neg_lower.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <visual name="part_04_handle_neg_upper">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_04_handle_neg_upper.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <visual name="part_05_grip">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_05_grip.obj" scale="1 1 1"/></geometry>
+      <material name="bucket_proxy"><color rgba="0.65 0.55 0.35 0.85"/></material>
+    </visual>
+    <collision name="part_00_solid_body">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_00_solid_body.obj" scale="1 1 1"/></geometry>
+    </collision>
+    <collision name="part_01_handle_pos_lower">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_01_handle_pos_lower.obj" scale="1 1 1"/></geometry>
+    </collision>
+    <collision name="part_02_handle_pos_upper">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_02_handle_pos_upper.obj" scale="1 1 1"/></geometry>
+    </collision>
+    <collision name="part_03_handle_neg_lower">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_03_handle_neg_lower.obj" scale="1 1 1"/></geometry>
+    </collision>
+    <collision name="part_04_handle_neg_upper">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_04_handle_neg_upper.obj" scale="1 1 1"/></geometry>
+    </collision>
+    <collision name="part_05_grip">
+      <geometry><mesh filename="bucket_proxy_minimal_v1/part_05_grip.obj" scale="1 1 1"/></geometry>
+    </collision>
+  </link>
+</robot>

@@ -152,8 +152,8 @@ def validate_config(cfg: RetargetingConfig) -> None:
     # Task-specific format requirements
     if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
         raise ValueError("Climbing task requires 'mocap' data format")
-    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
-        raise ValueError("Object interaction requires 'smplh' data format")
+    if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh", "lafan"):
+        raise ValueError("Object interaction requires 'smplh' or converted 'lafan' data format")
     # robot_only accepts any format in the registry (already validated above)
 
 
@@ -260,12 +260,21 @@ def load_motion_data(
         object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
 
     elif task_type == "object_interaction":
-        pt_path = data_path / f"{task_name}.pt"
-        if not pt_path.exists():
-            raise FileNotFoundError(f"InterMimic data file not found: {pt_path}")
+        if data_format == "lafan":
+            npz_path = data_path / f"{task_name}.npz"
+            if not npz_path.exists():
+                raise FileNotFoundError(f"Converted LAFAN interaction data not found: {npz_path}")
+            interaction_data = np.load(str(npz_path))
+            human_joints = interaction_data["global_joint_positions"]
+            object_poses = interaction_data["object_poses"]
+            smpl_scale = motion_data_config.default_scale_factor or 1.0
+        else:
+            pt_path = data_path / f"{task_name}.pt"
+            if not pt_path.exists():
+                raise FileNotFoundError(f"InterMimic data file not found: {pt_path}")
 
-        human_joints, object_poses = load_intermimic_data(str(pt_path))
-        smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
+            human_joints, object_poses = load_intermimic_data(str(pt_path))
+            smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
 
     elif task_type == "climbing":
         task_dir = data_path / task_name
@@ -474,8 +483,12 @@ def build_retargeter_kwargs_from_config(
         "activate_joint_limits": retargeter_config.activate_joint_limits,
         "activate_obj_non_penetration": retargeter_config.activate_obj_non_penetration,
         "activate_foot_sticking": retargeter_config.activate_foot_sticking,
+        "activate_foot_grounding": retargeter_config.activate_foot_grounding,
+        "interpolate_failed_frames": retargeter_config.interpolate_failed_frames,
         "penetration_tolerance": retargeter_config.penetration_tolerance,
         "foot_sticking_tolerance": retargeter_config.foot_sticking_tolerance,
+        "foot_ground_height": retargeter_config.foot_ground_height,
+        "foot_ground_weight": retargeter_config.foot_ground_weight,
         "step_size": retargeter_config.step_size,
         "visualize": retargeter_config.visualize,
         "debug": retargeter_config.debug,
@@ -695,7 +708,17 @@ def main(cfg: RetargetingConfig) -> None:
     )
 
     # Extract foot sticking sequences
-    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(human_joints, retargeter.demo_joints, toe_names)
+    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(
+        human_joints,
+        retargeter.demo_joints,
+        toe_names,
+        velocity_threshold=cfg.retargeter.foot_contact_velocity_threshold,
+        height_threshold=(
+            cfg.retargeter.foot_contact_height_threshold
+            if cfg.retargeter.activate_foot_grounding
+            else None
+        ),
+    )
 
     # Task-specific foot sticking adjustments
     if task_type == "object_interaction":

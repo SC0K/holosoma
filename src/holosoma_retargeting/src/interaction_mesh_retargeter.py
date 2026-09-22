@@ -35,6 +35,53 @@ from utils import (  # type: ignore[import-not-found,no-redef]  # noqa: E402
 from viser_utils import create_motion_control_sliders  # type: ignore[import-not-found,no-redef]  # noqa: E402
 
 
+def interpolate_failed_robot_frames(
+    qpos: np.ndarray,
+    failed_frames: list[int],
+    robot_qpos_size: int,
+) -> np.ndarray:
+    """Interpolate failed robot poses while leaving tracked object poses untouched."""
+    result = np.asarray(qpos, dtype=float).copy()
+    if not failed_frames:
+        return result
+
+    failed = np.zeros(len(result), dtype=bool)
+    failed[np.asarray(failed_frames, dtype=int)] = True
+    if failed.all():
+        raise RuntimeError("Cannot interpolate a motion when every solver frame failed")
+
+    start = 0
+    while start < len(result):
+        if not failed[start]:
+            start += 1
+            continue
+        end = start
+        while end + 1 < len(result) and failed[end + 1]:
+            end += 1
+
+        left = start - 1 if start > 0 else None
+        right = end + 1 if end + 1 < len(result) else None
+        if left is None:
+            result[start : end + 1, :robot_qpos_size] = result[right, :robot_qpos_size]
+        elif right is None:
+            result[start : end + 1, :robot_qpos_size] = result[left, :robot_qpos_size]
+        else:
+            left_robot = result[left, :robot_qpos_size].copy()
+            right_robot = result[right, :robot_qpos_size].copy()
+            left_quat = left_robot[3:7]
+            right_quat = right_robot[3:7]
+            if np.dot(left_quat, right_quat) < 0:
+                right_quat = -right_quat
+            for frame in range(start, end + 1):
+                alpha = (frame - left) / (right - left)
+                result[frame, :robot_qpos_size] = (1.0 - alpha) * left_robot + alpha * right_robot
+                quat = (1.0 - alpha) * left_quat + alpha * right_quat
+                result[frame, 3:7] = quat / (np.linalg.norm(quat) + 1e-12)
+        start = end + 1
+
+    return result
+
+
 class InteractionMeshRetargeter:
     """
     A class to perform kinematic retargeting from human motion to a robot,
@@ -47,12 +94,16 @@ class InteractionMeshRetargeter:
         object_urdf_path: str,
         q_a_init_idx: int = -7,
         activate_foot_sticking: bool = True,
+        activate_foot_grounding: bool = False,
+        interpolate_failed_frames: bool = False,
         activate_obj_non_penetration: bool = True,
         activate_joint_limits: bool = True,
         step_size: float = 0.2,
         collision_detection_threshold: float = 0.1,
         penetration_tolerance: float = 1e-3,
         foot_sticking_tolerance: float = 1e-3,
+        foot_ground_height: float = 0.005,
+        foot_ground_weight: float = 1000.0,
         visualize: bool = False,
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
@@ -94,6 +145,8 @@ class InteractionMeshRetargeter:
         self.object_name = task_constants.OBJECT_NAME
         self.collision_detection_threshold = collision_detection_threshold
         self.activate_foot_sticking = activate_foot_sticking
+        self.activate_foot_grounding = activate_foot_grounding
+        self.interpolate_failed_frames = interpolate_failed_frames
         self.activate_obj_non_penetration = activate_obj_non_penetration
         self.activate_joint_limits = activate_joint_limits
         self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
@@ -112,6 +165,8 @@ class InteractionMeshRetargeter:
         self.smooth_weight = 0.2
         # Tolerance for foot sticking constraints in x, y.
         self.foot_sticking_tolerance = foot_sticking_tolerance
+        self.foot_ground_height = foot_ground_height
+        self.foot_ground_weight = foot_ground_weight
 
         # Setup visualization if requested
         if self.visualize:
@@ -349,6 +404,8 @@ class InteractionMeshRetargeter:
         q_locked_list[:, -7:] = object_poses_augmented
         q = np.copy(q_locked_list[0])
         retargeted_motions = [q]
+        failed_frame_indices: list[int] = []
+        cost = np.nan
 
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
@@ -406,19 +463,28 @@ class InteractionMeshRetargeter:
                 else:
                     w_nominal_tracking = self.w_nominal_tracking_init * np.exp(-i / self.nominal_tracking_tau)
 
-                q, cost = self.iterate(
-                    q_locked=q_locked_list[i],
-                    q_n=q,
-                    q_t_last=retargeted_motions[-1],
-                    target_laplacian=target_laplacian,
-                    adj_list=adj_list,
-                    obj_pts_local=object_points_local,
-                    foot_sticking=foot_sticking_sequences[i],
-                    w_nominal_tracking=w_nominal_tracking,
-                    q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
-                    init_t=i == 0,
-                    n_iter=50 if i == 0 else 10,
-                )
+                try:
+                    q, cost = self.iterate(
+                        q_locked=q_locked_list[i],
+                        q_n=q,
+                        q_t_last=retargeted_motions[-1],
+                        target_laplacian=target_laplacian,
+                        adj_list=adj_list,
+                        obj_pts_local=object_points_local,
+                        foot_sticking=foot_sticking_sequences[i],
+                        w_nominal_tracking=w_nominal_tracking,
+                        q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
+                        init_t=i == 0,
+                        n_iter=50 if i == 0 else 10,
+                    )
+                except RuntimeError as exc:
+                    if not self.interpolate_failed_frames or "CVXPY solve failed" not in str(exc):
+                        raise
+                    failed_frame_indices.append(i)
+                    q = np.copy(q_locked_list[i])
+                    q[self.q_a_indices] = retargeted_motions[-1][self.q_a_indices]
+                    cost = np.nan
+                    print(f"\nFrame {i} failed ({exc}); continuing for interpolation.")
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
@@ -431,7 +497,10 @@ class InteractionMeshRetargeter:
                 if self.visualize and self.debug:
                     self.draw_q(q)
 
-                pbar.set_postfix(cost=cost)
+                if np.isfinite(cost):
+                    pbar.set_postfix(cost=cost)
+                else:
+                    pbar.set_postfix(status="interpolate")
 
         # Remove previous debug visualization
         if self.debug:
@@ -453,6 +522,11 @@ class InteractionMeshRetargeter:
 
         # Save results
         qpos_arr = np.array(retargeted_motions)[1:]
+        qpos_arr = interpolate_failed_robot_frames(
+            qpos_arr,
+            failed_frame_indices,
+            7 + self.task_constants.ROBOT_DOF,
+        )
         body_positions = qpos_arr[:, :3][:, None, :]
         body_rotations = qpos_arr[:, 3:7][:, None, :]
         dof_positions = qpos_arr[:, 7:]
@@ -461,6 +535,7 @@ class InteractionMeshRetargeter:
             "human_joints": human_joint_motions,
             "fps": fps,
             "cost": cost,
+            "interpolated_frame_indices": np.asarray(failed_frame_indices, dtype=np.int64),
             # MuJoCo player Stage2 compatibility
             "body_positions": body_positions.astype(np.float32),
             "body_rotations": body_rotations.astype(np.float32),
@@ -486,7 +561,7 @@ class InteractionMeshRetargeter:
                 server=self.server,
                 viser_robot=self.viser_robot,
                 robot_base_frame=self.robot_base,
-                motion_sequence=np.asarray(retargeted_motions)[1:],
+                motion_sequence=qpos_arr,
                 robot_dof=robot_dof,
                 viser_object=self.viser_object,
                 object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
@@ -507,7 +582,7 @@ class InteractionMeshRetargeter:
                         self.viser_object.show_visual = show_meshes_cb.value
 
         return (
-            np.array(retargeted_motions)[1:],
+            qpos_arr,
             obj_pts_demo_list,
             obj_pts_list,
             tetrahedra,
@@ -582,14 +657,19 @@ class InteractionMeshRetargeter:
 
         # Constraints list
         constraints = []
+        foot_ground_residuals = []
 
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
 
         # Foot sticking
-        if (self.q_a_init_idx < 12) and self.activate_foot_sticking:
+        if (self.q_a_init_idx < 12) and (self.activate_foot_sticking or self.activate_foot_grounding):
             J_WF_dict, p_WF_dict, _ = self._calc_manipulator_jacobians(q, links=self.foot_links, obj_frame=False)
-            _, p_WF_t_last_dict, _ = self._calc_manipulator_jacobians(q_t_last, links=self.foot_links, obj_frame=False)
+            p_WF_t_last_dict = None
+            if self.activate_foot_sticking:
+                _, p_WF_t_last_dict, _ = self._calc_manipulator_jacobians(
+                    q_t_last, links=self.foot_links, obj_frame=False
+                )
             # Identify 'left' and 'right' flags from provided keys
             left_key = right_key = None
             for key in foot_sticking:
@@ -604,14 +684,19 @@ class InteractionMeshRetargeter:
                 apply_left = ("left" in key) and foot_sticking[left_key]
                 apply_right = ("right" in key) and foot_sticking[right_key]
                 if apply_left or apply_right:
-                    p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
-                    p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
+                    if self.activate_foot_sticking and p_WF_t_last_dict is not None:
+                        p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
+                        p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
-                    Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
-                    constraints += [
-                        Jxy @ dqa >= p_lb[:2],
-                        Jxy @ dqa <= p_ub[:2],
-                    ]
+                        Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
+                        constraints += [
+                            Jxy @ dqa >= p_lb[:2],
+                            Jxy @ dqa <= p_ub[:2],
+                        ]
+                    if self.activate_foot_grounding:
+                        z_delta = self.foot_ground_height - p_WF_dict[key][2]
+                        Jz = J_WF[2, self.q_a_indices]
+                        foot_ground_residuals.append(Jz @ dqa - z_delta)
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
@@ -633,6 +718,8 @@ class InteractionMeshRetargeter:
 
         # Objective
         obj_terms = []
+
+        obj_terms.extend(self.foot_ground_weight * cp.square(r) for r in foot_ground_residuals)
 
         obj_terms.append(cp.sum_squares(cp.multiply(sqrt_w3, lap_var - target_lap_vec)))
 
@@ -932,16 +1019,18 @@ class InteractionMeshRetargeter:
                 return False
             if contype[g2] == 0 and conaff[g2] == 0:
                 return False
-            if self.object_name in self._geom_names[g1] and "ground" in self._geom_names[g2]:
+            g1_is_object = self.object_name in self._geom_names[g1]
+            g2_is_object = self.object_name in self._geom_names[g2]
+            g1_is_ground = "ground" in self._geom_names[g1]
+            g2_is_ground = "ground" in self._geom_names[g2]
+            if g1_is_object and g2_is_ground:
                 return False
-            if "ground" in self._geom_names[g1] and self.object_name in self._geom_names[g2]:
+            if g1_is_ground and g2_is_object:
                 return False
-            return (
-                self.object_name in self._geom_names[g1]
-                or self.object_name in self._geom_names[g2]
-                or "ground" in self._geom_names[g1]
-                or "ground" in self._geom_names[g2]
-            )
+            has_object = g1_is_object or g2_is_object
+            if has_object and not self.activate_obj_non_penetration:
+                return False
+            return has_object or g1_is_ground or g2_is_ground
 
         for g1, g2 in candidates:
             # Optional: keep your own filters here (e.g., skip object-ground, only keep interaction with object/ground)

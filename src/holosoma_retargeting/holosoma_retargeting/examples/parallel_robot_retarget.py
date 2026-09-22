@@ -71,8 +71,10 @@ def find_files(data_dir: Path, data_format: str, object_name: str | None = None)
     data_dir = Path(data_dir)
 
     if data_format == "lafan":
-        # LAFAN: .npy files in root directory
-        files = [str(p) for p in data_dir.glob("*.npy")]
+        # Robot-only LAFAN uses README-style NPY. Converted object-interaction
+        # takes use NPZ because they also carry the tracked rigid-object pose.
+        suffix = "*.npz" if object_name else "*.npy"
+        files = [str(p) for p in data_dir.glob(suffix)]
         return sorted(files)
     if data_format == "smplh":
         # SMPLH/OMOMO: .pt files (optionally filtered by object_name)
@@ -309,7 +311,15 @@ def process_single_task(args):
 
         # Extract foot sticking sequences
         foot_sticking_sequences = extract_foot_sticking_sequence_velocity(
-            human_joints, retargeter.demo_joints, toe_names
+            human_joints,
+            retargeter.demo_joints,
+            toe_names,
+            velocity_threshold=retargeter_config.foot_contact_velocity_threshold,
+            height_threshold=(
+                retargeter_config.foot_contact_height_threshold
+                if retargeter_config.activate_foot_grounding
+                else None
+            ),
         )
 
         # Task-specific foot sticking adjustments

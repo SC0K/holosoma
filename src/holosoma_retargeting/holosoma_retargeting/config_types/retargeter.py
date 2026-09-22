@@ -66,6 +66,24 @@ class RetargeterConfig:
     activate_foot_sticking: bool = True
     """Whether to enforce foot sticking constraints."""
 
+    activate_foot_grounding: bool = False
+    """Whether to softly ground detected stance-foot collision spheres in Z."""
+
+    interpolate_failed_frames: bool = False
+    """Continue after infeasible solver frames and interpolate their robot poses."""
+
+    foot_contact_height_threshold: float = 0.04
+    """Maximum source-toe height above the estimated floor for stance detection."""
+
+    foot_contact_velocity_threshold: float = 0.01
+    """Maximum per-frame source-toe XY displacement for stance detection."""
+
+    foot_ground_height: float = 0.005
+    """Target Z of G1 sole-sphere centers; 0.005 matches their 5 mm radius."""
+
+    foot_ground_weight: float = 1000.0
+    """Weight of the soft stance-foot vertical grounding objective."""
+
     penetration_tolerance: float = 0.001
     """Tolerance for penetration when enforcing non-penetration constraints."""
 

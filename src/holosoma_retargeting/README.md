@@ -150,6 +150,88 @@ python examples/robot_retarget.py --data_path demo_data/lafan --task-type robot_
 python examples/parallel_robot_retarget.py --data-dir demo_data/lafan --task-type robot_only --data_format lafan --save_dir demo_results_parallel/g1/robot_only/lafan --task-config.object-name ground --task-config.ground-range -10 10 --retargeter.foot-sticking-tolerance 0.02
 ```
 
+#### FBX Object-Interaction Motions in LAFAN Format
+
+OptiTrack-style FBX takes containing both a performer and a tracked rigid
+object can be converted with Blender. The converter archives the full 60 Hz
+skeleton as BVH and writes HoloSoma's exact 22-joint LAFAN ordering at 30 Hz
+as `.npy` and `.npz`. The `.npz` also stores the tracked object pose.
+
+```bash
+cd holosoma_retargeting
+
+# Create the corrected box and bucket assets. Bucket interaction sampling uses
+# parts 01-05, while collision uses all six proxy parts as separate geoms so
+# the opening between the handle and body stays free.
+python data_utils/prepare_mocap_interaction_objects.py
+
+blender -b --python data_utils/convert_fbx_interaction_to_lafan.py -- \
+    --input "demo_data/mocap/fbx pickup" \
+    --output-dir demo_data/mocap/lafan_box \
+    --object-name carton_box \
+    --output-prefix box_pickup \
+    --downsample 2
+
+blender -b --python data_utils/convert_fbx_interaction_to_lafan.py -- \
+    --input "demo_data/mocap/fbx bucket" \
+    --output-dir demo_data/mocap/lafan_bucket \
+    --object-name bucket \
+    --downsample 2
+```
+
+Retarget the converted interactions to G1 with the relaxed LAFAN foot-sticking
+tolerance. For motions whose retargeted stance feet float above the floor, add
+`--retargeter.activate-foot-grounding`. This detects source toes that are both
+low and nearly stationary, then softly pulls the corresponding G1 sole spheres
+to the ground while retaining the robot-object collision constraints. It is
+left off for the box example because that motion is already grounded well.
+For sequences that occasionally produce an infeasible CVXPY frame, the opt-in
+`--retargeter.interpolate-failed-frames` flag continues solving later frames
+and interpolates only the failed robot poses between their valid neighbors.
+The tracked object pose is never interpolated or replaced, and the saved NPZ
+records the affected indices in `interpolated_frame_indices`.
+
+```bash
+python examples/robot_retarget.py \
+    --data-path demo_data/mocap/lafan_box \
+    --task-type object_interaction \
+    --task-name box_pickup \
+    --data-format lafan \
+    --task-config.object-name mocap_box \
+    --save-dir demo_results/g1/object_interaction/mocap_box \
+    --retargeter.foot-sticking-tolerance 0.02
+
+python examples/parallel_robot_retarget.py \
+    --data-dir demo_data/mocap/lafan_bucket \
+    --task-type object_interaction \
+    --data-format lafan \
+    --task-config.object-name bucket \
+    --save-dir demo_results_parallel/g1/object_interaction/mocap_bucket \
+    --max-workers 4 \
+    --retargeter.foot-sticking-tolerance 0.02 \
+    --retargeter.activate-foot-grounding
+```
+
+An FBX with only an object track and no performer armature is reported and
+skipped because it cannot produce a human-to-G1 motion.
+
+To compare a retargeted bucket motion with its original LAFAN skeleton in the
+same synchronized Viser scene:
+
+```bash
+python viser_player.py \
+    --qpos-npz demo_results_parallel/g1/object_interaction/mocap_bucket/bucket_024_original.npz \
+    --source-motion-npz demo_data/mocap/lafan_bucket/bucket_024.npz \
+    --source-object-mesh models/bucket/bucket.stl \
+    --robot-urdf models/g1/g1_29dof.urdf \
+    --object-urdf models/bucket/bucket.urdf \
+    --fps 30 --loop
+```
+
+The source skeleton and orange source bucket are overlaid by default. Use
+`--source-skeleton-offset 1.5 0 0` to move both together for a side-by-side
+comparison, or toggle them independently from the **Display** panel.
+
 ### AMASS SMPL-X
 
 #### Download the Original AMASS Data

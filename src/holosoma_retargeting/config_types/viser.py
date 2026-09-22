@@ -22,6 +22,21 @@ class ViserConfig:
     object_urdf: str | None = None
     """Path to object URDF file (optional)."""
 
+    source_motion_npz: str | None = None
+    """Optional source NPZ containing global_joint_positions and joint_names."""
+
+    source_object_mesh: str | None = None
+    """Optional mesh for the original object's source-pose track."""
+
+    source_skeleton_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """XYZ offset applied to the source skeleton, useful for side-by-side viewing."""
+
+    source_skeleton_point_size: float = 0.025
+    """Displayed source-skeleton joint size in meters."""
+
+    source_skeleton_line_width: float = 4.0
+    """Displayed source-skeleton bone width."""
+
     show_object_axes: bool = True
     """Whether to render XYZ axes for the object frame."""
 
@@ -36,6 +51,12 @@ class ViserConfig:
 
     show_meshes: bool = True
     """Whether to show mesh visualizations."""
+
+    show_source_skeleton: bool = True
+    """Whether to show the original motion skeleton when provided."""
+
+    show_source_object: bool = True
+    """Whether to show the original object mesh when provided."""
 
     grid_width: float = 8.0
     """Grid width for visualization."""

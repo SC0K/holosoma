@@ -335,7 +335,9 @@ def augment_object_poses(
         rotation_list[object_moving_frame_idx:] = rotation_initial * np.exp(
             (object_moving_frame_idx - np.arange(object_moving_frame_idx, N)) / rotation_tau
         )
-        rotation = R.from_euler("z", rotation_list)
+        rotation_vectors = np.zeros((N, 3), dtype=float)
+        rotation_vectors[:, 2] = rotation_list
+        rotation = R.from_rotvec(rotation_vectors)
         object_quat = R.from_quat(object_poses[:, :4], scalar_first=True)
         object_quat_rotated = (rotation * object_quat).as_quat(scalar_first=True)
         object_poses_augmented[:, :4] = object_quat_rotated
@@ -691,15 +693,23 @@ def create_new_scene_xml_file(
     return output_path
 
 
-def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names, velocity_threshold=0.01):
+def extract_foot_sticking_sequence_velocity(
+    smpl_joints,
+    demo_joints,
+    foot_names,
+    velocity_threshold=0.01,
+    height_threshold=None,
+):
     """
-    Extract contact sequence from SMPL joint data based on x,y velocity of toe joints.
+    Extract contact sequence from SMPL joint data based on toe velocity and height.
 
     Args:
         smpl_joints (np.ndarray): SMPL joint positions of shape (T, N, 3).
         demo_joints (list): List of joint names.
         foot_names (list): List of foot joint names [left_foot, right_foot].
         velocity_threshold (float): Threshold for xy velocity to determine contact.
+        height_threshold (float | None): Maximum toe height above the estimated
+            source floor. When omitted, contact uses velocity only.
 
     Returns:
         list: List of contact dictionaries for each frame.
@@ -708,7 +718,7 @@ def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names
     left_toe_idx = demo_joints.index(foot_names[0])
     right_toe_idx = demo_joints.index(foot_names[1])
 
-    # Check xy velocities
+    # Check XY velocities and, when requested, height relative to the mocap floor.
     left_toe_positions = smpl_joints[:, left_toe_idx, :2]
     right_toe_positions = smpl_joints[:, right_toe_idx, :2]
 
@@ -718,8 +728,17 @@ def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names
     left_toe_velocity = np.concatenate([[velocity_threshold + 1], left_toe_velocity])
     right_toe_velocity = np.concatenate([[velocity_threshold + 1], right_toe_velocity])
 
+    left_contact = left_toe_velocity <= velocity_threshold
+    right_contact = right_toe_velocity <= velocity_threshold
+    if height_threshold is not None:
+        left_z = smpl_joints[:, left_toe_idx, 2]
+        right_z = smpl_joints[:, right_toe_idx, 2]
+        floor_z = min(float(np.quantile(left_z, 0.05)), float(np.quantile(right_z, 0.05)))
+        left_contact &= left_z <= floor_z + height_threshold
+        right_contact &= right_z <= floor_z + height_threshold
+
     return [
-        {"L_Toe": left_toe_velocity[i] <= velocity_threshold, "R_Toe": right_toe_velocity[i] <= velocity_threshold}
+        {"L_Toe": bool(left_contact[i]), "R_Toe": bool(right_contact[i])}
         for i in range(len(smpl_joints))
     ]
 
